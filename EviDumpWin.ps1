@@ -1,517 +1,386 @@
 [CmdletBinding()]
-param(
-    [string]$ReportPath = (Join-Path -Path (Get-Location) -ChildPath "Auditoria-Scripts(Resultado).md"),
-    [switch]$VerboseReport
-)
+param()
 
-# --- Globals ---
-$script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
-$script:ReportLines = New-Object System.Collections.Generic.List[string]
-$script:Summary = [ordered]@{}
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
 $script:Now = Get-Date
-$script:IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-# ================================
-# BANNER DE INICIO
-# ================================
-function Show-Banner {
-    Write-Host ""
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host "              EviDumpWin" -ForegroundColor Yellow
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host " Equipo: $env:COMPUTERNAME" -ForegroundColor White
-    Write-Host " Usuario: $env:USERNAME" -ForegroundColor White
-    Write-Host " Fecha: $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')" -ForegroundColor White
-    Write-Host " Reporte: $ReportPath" -ForegroundColor White
-    Write-Host ""
-    Write-Host " Analizando sistema..." -ForegroundColor Green
-    Write-Host "==================================================" -ForegroundColor Cyan
-    Write-Host ""
+$script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
+$script:Report = New-Object System.Collections.Generic.List[string]
+$script:Summary = New-Object System.Collections.Generic.List[object]
+$script:Results = New-Object System.Collections.Generic.List[object]
+$script:Dirs = [ordered]@{}
+$script:CaseRoot = ''
+$script:ReportPath = ''
+$script:LogPath = ''
+$script:HashPath = ''
+$script:Profile = 'Completo'
+$script:ProgressTotal = 0
+$script:ProgressCurrent = 0
+$script:RunTimer = $null
+$script:ArtifactStats = [ordered]@{
+ Json = 0
+ Csv = 0
+ Txt = 0
+ Raw = 0
+ Registry = 0
+ Events = 0
+ Browser = 0
+ Timeline = 0
+ HashFailures = 0
 }
 
-# ================================
-# BARRA DE PROGRESO
-# ================================
-function Show-Progress {
-    param(
-        [string]$Activity = "Ejecutando Auditoria",
-        [string]$Status = "Procesando",
-        [int]$PercentComplete = 0
-    )
-    Write-Progress -Activity $Activity -Status $Status -PercentComplete $PercentComplete
+function C([string]$m,[string]$c='Gray'){ Write-Host $m -ForegroundColor $c }
+function Info([string]$m){ C "[*] $m" 'Cyan' }
+function Ok([string]$m){ C "[+] $m" 'Green' }
+function Warn([string]$m){ C "[!] $m" 'Yellow' }
+function Fail([string]$m){ C "[-] $m" 'Red' }
+function RL([string]$t=''){ $script:Report.Add($t) }
+function RT([string]$t,[int]$l=2){ RL ''; RL ((('#'*$l)+' '+$t)); RL '' }
+function ST([string]$a,[string]$e,[string]$d){ $script:Summary.Add([pscustomobject]@{Area=$a;Estado=$e;Detalle=$d}) }
+function LG([string]$lvl,[string]$msg){ Add-Content -LiteralPath $script:LogPath -Value ("[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$lvl.ToUpper(),$msg) -Encoding utf8 }
+function Safe([string]$n){ (($n -replace '[\\/:*?"<>|]','_') -replace '\s+','_') }
+function SaveLines([string]$p,[string[]]$lines){ $dir=Split-Path -Parent $p; if(-not(Test-Path $dir)){New-Item -ItemType Directory -Path $dir -Force|Out-Null}; [IO.File]::WriteAllLines($p,$lines,$script:Utf8Bom) }
+function AddStat([string]$key,[int]$delta=1){ if($script:ArtifactStats.Contains($key)){ $script:ArtifactStats[$key]+=$delta } }
+function Ask([string]$prompt,[string]$def){ $v=Read-Host "$prompt [$def]"; if([string]::IsNullOrWhiteSpace($v)){$def}else{$v.Trim()} }
+function Menu([string]$title,[string[]]$opts,[int]$def=0){ while($true){ Write-Host ''; C $title Yellow; for($i=0;$i -lt $opts.Count;$i++){ $m=' '; if($i -eq $def){$m='*'}; Write-Host (" [{0}] {1} {2}" -f ($i+1),$m,$opts[$i]) }; $raw=Read-Host ("Selecciona opcion [{0}]" -f ($def+1)); if([string]::IsNullOrWhiteSpace($raw)){ return $opts[$def] }; $n=0; if([int]::TryParse($raw,[ref]$n) -and $n -ge 1 -and $n -le $opts.Count){ return $opts[$n-1] }; Warn 'Opcion no valida.' } }
+function Tbl([string[]]$h,[object[]]$rows){ if(-not $h){return}; RL ('| '+($h -join ' | ')+' |'); RL ('|'+(($h|ForEach-Object{'---'}) -join '|')+'|'); foreach($r in $rows){ $vals=foreach($x in $h){ $v='-'; if($null -ne $r.$x){ $v=[string]$r.$x }; $v.Replace("`r",'').Replace("`n",'<br>') }; RL ('| '+($vals -join ' | ')+' |') }; RL '' }
+function ToObj($o){ if($null -eq $o){return $null}; if($o -is [string] -or $o -is [ValueType]){return $o}; if($o -is [System.Collections.IEnumerable] -and -not ($o -is [string])){ return @($o | ForEach-Object { ToObj $_ }) }; $p=[ordered]@{}; foreach($x in $o.PSObject.Properties){ if($x.MemberType -match 'Property'){ try{$p[$x.Name]=ToObj $x.Value}catch{$p[$x.Name]='[unavailable]'} } }; [pscustomobject]$p }
+function ExportSet([string]$name,$data,[switch]$NoCsv){ $s=Safe $name; $j=Join-Path $script:Dirs.Json "$s.json"; $t=Join-Path $script:Dirs.Txt "$s.txt"; (ToObj $data)|ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $j -Encoding utf8; AddStat 'Json'; ($data|Out-String -Width 4096) | Set-Content -LiteralPath $t -Encoding utf8; AddStat 'Txt'; if(-not $NoCsv){ try{ $c=Join-Path $script:Dirs.Csv "$s.csv"; @($data)|Export-Csv -LiteralPath $c -NoTypeInformation -Encoding utf8; AddStat 'Csv' }catch{ LG WARN ("CSV {0}: {1}" -f $name,$_.Exception.Message) } } }
+function CmdOut([string]$name,[scriptblock]$sb){ $p=Join-Path $script:Dirs.Raw ((Safe $name)+'.txt'); try{ (& $sb 2>&1 | Out-String -Width 4096) | Set-Content -LiteralPath $p -Encoding utf8; AddStat 'Raw'; $true }catch{ $_.Exception.Message | Set-Content -LiteralPath $p -Encoding utf8; AddStat 'Raw'; LG WARN ("Comando {0}: {1}" -f $name,$_.Exception.Message); $false } }
+function CopyIf([string]$src,[string]$dst,[switch]$Rec){ try{ if(Test-Path -LiteralPath $src){ Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse:$Rec -ErrorAction Stop; return $true } }catch{ LG WARN ("Copia {0}: {1}" -f $src,$_.Exception.Message) }; $false }
+function RegVals([string]$path){ try{ $i=Get-Item -LiteralPath $path -ErrorAction Stop; $p=Get-ItemProperty -LiteralPath $path -ErrorAction Stop; @($p.PSObject.Properties|Where-Object{$_.Name -notmatch '^PS'}|ForEach-Object{ [pscustomobject]@{Key=$i.Name;Name=$_.Name;Value=(($_.Value|Out-String).Trim())} }) }catch{ LG WARN ("Registro {0}: {1}" -f $path,$_.Exception.Message); @() } }
+function RegKeys([string]$path){ try{ @(Get-ChildItem -LiteralPath $path -ErrorAction Stop | Select-Object PSChildName,Name,PSPath) }catch{ LG WARN ("Subclaves {0}: {1}" -f $path,$_.Exception.Message); @() } }
+function ShowProg([string]$status,[int]$step,[int]$total,[int]$sub=-1){
+ $pct=0
+ if($total -gt 0){
+  $pct=[math]::Floor((($step-1)/$total)*100)
+  if($sub -ge 0){ $pct=[math]::Min(99,[math]::Floor((($step-1 + ($sub/100))/$total)*100)) }
+ }
+ try{ Write-Progress -Activity 'EviDumpWin - Adquisicion Forense' -Status $status -PercentComplete $pct }catch{}
+}
+function EndProg(){ try{ Write-Progress -Activity 'EviDumpWin - Adquisicion Forense' -Completed }catch{} }
+function RunCollect([string]$name,[scriptblock]$sb){
+ $script:ProgressCurrent++
+ ShowProg -status ("Fase {0}/{1}: {2}" -f $script:ProgressCurrent,$script:ProgressTotal,$name) -step $script:ProgressCurrent -total $script:ProgressTotal
+ Info "Ejecutando $name"
+ $sw=[Diagnostics.Stopwatch]::StartNew()
+ try{
+  & $sb
+  $sw.Stop()
+  $script:Results.Add([pscustomobject]@{Nombre=$name;Estado='OK';Segundos=[math]::Round($sw.Elapsed.TotalSeconds,2);Minutos=[math]::Round($sw.Elapsed.TotalMinutes,2)})
+  LG INFO "$name OK"
+  Ok ("{0} completado en {1}s" -f $name,[math]::Round($sw.Elapsed.TotalSeconds,2))
+ }catch{
+  $sw.Stop()
+  $script:Results.Add([pscustomobject]@{Nombre=$name;Estado='ERROR';Segundos=[math]::Round($sw.Elapsed.TotalSeconds,2);Minutos=[math]::Round($sw.Elapsed.TotalMinutes,2)})
+  LG ERROR ("{0}: {1}" -f $name,$_.Exception.Message)
+  Warn "$name fallo: $($_.Exception.Message)"
+ }
 }
 
-# -----------------------------------------
-# Utilities
-# -----------------------------------------
-function Add-Line([string]$Text = "") {
-    $script:ReportLines.Add($Text)
-}
-function Add-Block([string[]]$Lines) {
-    foreach ($l in $Lines) { Add-Line $l }
-}
-function Add-Title([string]$Text, [int]$Level = 2) {
-    Add-Line ""
-    Add-Line ("{0} {1}" -f ("#" * $Level), $Text)
-    Add-Line ""
-}
-function Add-KeyValueTable([hashtable]$Pairs) {
-    Add-Line "| Clave | Valor |"
-    Add-Line "|------:|:------|"
-    foreach ($k in $Pairs.Keys) {
-        $v = if ($Pairs[$k]) { $Pairs[$k] } else { "-" }
-        Add-Line ("| **{0}** | {1} |" -f $k, ($v.ToString()).Replace("`n","<br>"))
-    }
-    Add-Line ""
-}
-function Add-Table([string[]]$Headers, [object[]]$Rows) {
-    if (-not $Headers -or $Headers.Count -eq 0) { return }
-    Add-Line ("| {0} |" -f ($Headers -join " | "))
-    Add-Line ("|{0}|" -f (($Headers | ForEach-Object { "---" }) -join "|"))
-    foreach ($r in $Rows) {
-        if ($r -is [string]) {
-            Add-Line "| $r |"
-        } else {
-            $vals = @()
-            foreach ($h in $Headers) { $vals += ($r.$h -as [string]) }
-            Add-Line ("| {0} |" -f ($vals -join " | "))
-        }
-    }
-    Add-Line ""
+function Banner{
+ try{ Clear-Host }catch{}
+ C '============================================================' Cyan
+ C '         EviDumpWin Forensic Collector  - By: Mayky  ' Yellow
+ C '============================================================' Cyan
+ Write-Host ''
+ Write-Host " Equipo  : $env:COMPUTERNAME"
+ Write-Host " Usuario : $env:USERNAME"
+ Write-Host " Fecha   : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')"
+ Write-Host " Root    : $(if($script:IsAdmin){'Si'}else{'No'})"
+ Write-Host ''
+
 }
 
-function Save-Report() {
-    try {
-        $dir = Split-Path -Path $ReportPath -Parent
-        if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-        [System.IO.File]::WriteAllLines($ReportPath, $script:ReportLines, $script:Utf8Bom)
-        Write-Host "Informe generado en: $ReportPath" -ForegroundColor Green
-    } catch {
-        Write-Error "No se pudo guardar el informe: $($_.Exception.Message)"
-    }
-}
-function Fmt-Date($dt, [string]$fmt = "dd/MM/yyyy HH:mm:ss") {
-    if (-not $dt) { return "-" }
-    try { return ([datetime]$dt).ToString($fmt) } catch { return "$dt" }
-}
-function Set-Summary([string]$Key, [string]$Value) {
-    $script:Summary[$Key] = $Value
+function Setup{
+ Banner
+ $root=Ask 'Ruta base del caso' (Join-Path (Get-Location) 'EviDumpWin-Cases')
+ $case=Ask 'Nombre del caso' ("{0}_{1}" -f $env:COMPUTERNAME,(Get-Date -Format 'yyyyMMdd_HHmmss'))
+ $script:Profile=Menu 'Perfil de adquisicion' @('Rapido - evidencia volatil y estado actual','Completo - recomendado para auditoria forense','Pro - intenta extraer todo lo posible') 1
+ $script:CaseRoot=Join-Path $root (Safe $case)
+ $script:Dirs=[ordered]@{Reports=(Join-Path $script:CaseRoot 'Reports');Logs=(Join-Path $script:CaseRoot 'Logs');Json=(Join-Path $script:CaseRoot 'Artifacts\Json');Csv=(Join-Path $script:CaseRoot 'Artifacts\Csv');Txt=(Join-Path $script:CaseRoot 'Artifacts\Txt');Raw=(Join-Path $script:CaseRoot 'Artifacts\Raw');Registry=(Join-Path $script:CaseRoot 'Artifacts\Registry');Events=(Join-Path $script:CaseRoot 'Artifacts\Events');Browser=(Join-Path $script:CaseRoot 'Artifacts\Browser');Timeline=(Join-Path $script:CaseRoot 'Artifacts\Timeline')}
+ foreach($p in $script:Dirs.Values){ New-Item -ItemType Directory -Path $p -Force|Out-Null }
+ $script:ReportPath=Join-Path $script:Dirs.Reports 'Informe_Forense.md'
+ $script:LogPath=Join-Path $script:Dirs.Logs 'EviDumpWin.log'
+ $script:HashPath=Join-Path $script:Dirs.Reports 'hash_manifest_sha256.csv'
+ Set-Content -LiteralPath $script:LogPath -Value '' -Encoding utf8
 }
 
-# -----------------------------------------
-# 0. Informacion general del sistema
-# -----------------------------------------
-function Get-InfoGeneral {
-    Add-Title "0. Informacion general del sistema" 2
-
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
-    $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
-    $memTotalGB = if ($cs.TotalPhysicalMemory) { [math]::Round($cs.TotalPhysicalMemory / 1GB, 2) } else { "-" }
-    
-    # Manejo seguro de LastBootUpTime
-    $lastBoot = $null
-    if ($os.LastBootUpTime) {
-        try {
-            $lastBoot = [Management.ManagementDateTimeConverter]::ToDateTime($os.LastBootUpTime)
-        } catch {
-            try {
-                $lastBoot = Get-Date $os.LastBootUpTime -ErrorAction SilentlyContinue
-            } catch {
-                $lastBoot = $null
-            }
-        }
-    }
-    
-    $uptime = if ($lastBoot) { (New-TimeSpan -Start $lastBoot -End $script:Now) } else { $null }
-
-    $info = [ordered]@{
-        "Equipo"         = $env:COMPUTERNAME
-        "Usuario"        = $env:USERNAME
-        "Dominio/Grupo"  = if ($cs.Domain) { $cs.Domain } else { $cs.Workgroup }
-        "SO"             = if ($os.Caption) { "$($os.Caption) (Build $($os.BuildNumber))" } else { "-" }
-        "Instalacion SO" = Fmt-Date $os.InstallDate
-        "Arranque"       = Fmt-Date $lastBoot
-        "Uptime"         = if ($uptime) { "{0:dd}d {0:hh}h {0:mm}m" -f $uptime } else { "-" }
-        "CPU"            = if ($cpu) { $cpu.Name } else { "-" }
-        "RAM"            = if ($memTotalGB -ne "-") { "$memTotalGB GB" } else { "-" }
-        "Administrador"  = if ($script:IsAdmin) { "Si" } else { "No" }
-        "Fecha Informe"  = Fmt-Date $script:Now
-    }
-    Add-KeyValueTable $info
-
-    # Firewall
-    try {
-        $fw = Get-NetFirewallProfile -ErrorAction Stop
-        $d = ($fw | Where-Object Name -eq "Domain").Enabled
-        $p = ($fw | Where-Object Name -eq "Private").Enabled
-        $u = ($fw | Where-Object Name -eq "Public").Enabled
-        $fwTxt = "Dominio: {0} / Privada: {1} / Publica: {2}" -f ($(if ($d) { 'On' }else { 'Off' }), $(if ($p) { 'On' }else { 'Off' }), $(if ($u) { 'On' }else { 'Off' }))
-        $fwIcon = if ($d -and $p -and $u) { "OK" } else { "WARNING" }
-        Add-Table @("Componente","Estado") @([pscustomobject]@{ Componente="Firewall de Windows"; Estado="$fwIcon $fwTxt" })
-        Set-Summary "Firewall" ("{0} {1}" -f $fwIcon, $fwTxt)
-    } catch {
-        Add-Table @("Componente","Estado") @([pscustomobject]@{ Componente="Firewall de Windows"; Estado="WARNING No se pudo consultar" })
-        Set-Summary "Firewall" "WARNING No se pudo consultar"
-    }
+function InitReport{
+ RT 'EviDumpWin - Adquisicion Forense Windows' 1
+ RL "Generado: $($script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz'))"
+ RL "Equipo: $env:COMPUTERNAME"
+ RL "Usuario: $env:USERNAME"
+ RL "Perfil: $script:Profile"
+ RL "Elevado: $(if($script:IsAdmin){'Si'}else{'No'})"
+ RL "Ruta del caso: $script:CaseRoot"
+ RL ''
+ RL '> Nota: Adquisicion en vivo. Los resultados dependen de permisos, bloqueo de ficheros y estado del sistema.'
+ RL ''
 }
 
-# -----------------------------------------
-# 1. Permisos administrador
-# -----------------------------------------
-function Get-Permisos-Administrador {
-    Add-Title "1. Permisos - Administrador (Resultado)" 2
-    if ($script:IsAdmin) {
-        Add-Line "OK El usuario actual tiene permisos de administrador (sesion elevada)."
-        Set-Summary "Administrador" "OK Si"
-    } else {
-        Add-Line "NO El usuario actual NO tiene permisos de administrador."
-        Set-Summary "Administrador" "NO No"
-    }
+function CollectSystem{
+ $os=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+ $cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+ $bios=Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue
+ $cpu=Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue|Select-Object -First 1
+ $ram=0; if($cs -and $cs.TotalPhysicalMemory){ $ram=[math]::Round($cs.TotalPhysicalMemory/1GB,2) }
+ $sum=[pscustomobject]@{Equipo=$env:COMPUTERNAME;SO=$(if($os){$os.Caption}else{'No disponible'});Version=$(if($os){$os.Version}else{'-'});Build=$(if($os){$os.BuildNumber}else{'-'});Arranque=$(if($os){$os.LastBootUpTime}else{'-'});Fabricante=$(if($cs){$cs.Manufacturer}else{'-'});Modelo=$(if($cs){$cs.Model}else{'-'});Dominio=$(if($cs){$cs.Domain}else{'-'});CPU=$(if($cpu){$cpu.Name}else{'-'});RAMGB=$ram;BIOS=$(if($bios){$bios.SMBIOSBIOSVersion}else{'-'});Serie=$(if($bios){$bios.SerialNumber}else{'-'});Zona=(Get-TimeZone).DisplayName}
+ $vol=@(); try{ $vol=Get-Volume -ErrorAction Stop|Select-Object DriveLetter,FileSystemLabel,FileSystem,SizeRemaining,Size,HealthStatus }catch{ LG WARN "Get-Volume no disponible." }
+ $disk=@(); try{ $disk=Get-Disk -ErrorAction Stop|Select-Object Number,FriendlyName,SerialNumber,PartitionStyle,HealthStatus,Size }catch{ LG WARN "Get-Disk no disponible." }
+ $bl=@(); try{ $bl=Get-BitLockerVolume -ErrorAction Stop|Select-Object MountPoint,ProtectionStatus,EncryptionMethod,VolumeStatus }catch{ LG WARN "BitLocker no disponible." }
+ ExportSet 'system_summary' $sum -NoCsv
+ ExportSet 'volume_inventory' $vol
+ ExportSet 'disk_inventory' $disk
+ ExportSet 'bitlocker_status' $bl
+ RT 'Sistema'
+ Tbl @('Equipo','SO','Version','Build','Dominio','CPU','RAMGB','Zona') @($sum)
+ ST 'Sistema' 'OK' "$($sum.SO) / Build $($sum.Build) / $($sum.RAMGB) GB"
 }
 
-# -----------------------------------------
-# 2. Actualizaciones y Antivirus
-# -----------------------------------------
-function Get-Actualizaciones {
-    Add-Title "2. Buscar Actualizaciones (Resultado)" 2
-    $updatesTxt = "WARNING No se pudo consultar las actualizaciones."
-
-    try {
-        $session = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        $pending = $searcher.Search("IsInstalled=0 and Type='Software'").Updates.Count
-        if ($pending -eq 0) { 
-            $updatesTxt = "OK El sistema esta actualizado. Sin actualizaciones pendientes." 
-        } else { 
-            $updatesTxt = "WARNING Hay $pending actualizaciones pendientes." 
-        }
-    } catch {
-        $updatesTxt = "WARNING No fue posible consultar Windows Update (posible restriccion/WSUS)."
-    }
-
-    # Ultima KB
-    $kbLine = "NO No se hallaron KBs instaladas recientemente."
-    try {
-        $qfe = Get-CimInstance -ClassName Win32_QuickFixEngineering -ErrorAction SilentlyContinue | Where-Object { $_.HotFixID }
-        $kbs = foreach ($k in $qfe) {
-            $dt = $null
-            if ($k.InstalledOn) { try { $dt = [datetime]$k.InstalledOn } catch { } }
-            [pscustomobject]@{ KB = $k.HotFixID; Date = $dt }
-        }
-        $last = $kbs | Sort-Object Date -Descending | Select-Object -First 1
-        if ($last) { 
-            $kbLine = "OK Ultima actualizacion instalada: $($last.KB) el $(Fmt-Date $last.Date 'dd/MM/yyyy')." 
-        }
-    } catch {
-        # Catch vacio pero valido
-    }
-
-    Add-Block @(
-        "Estado de actualizacion:",
-        $updatesTxt,
-        "",
-        $kbLine
-    )
-
-    Set-Summary "Actualizaciones" ($updatesTxt -replace "\*\*", "")
+function CollectUsers{
+ $users=Get-LocalUser -ErrorAction SilentlyContinue|Select-Object Name,Enabled,LastLogon,PasswordLastSet,PrincipalSource
+ $groups=Get-LocalGroup -ErrorAction SilentlyContinue|Select-Object Name,Description
+ $admins=@(Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue|Select-Object Name,ObjectClass,PrincipalSource)
+ $profiles=Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue|Where-Object{$_.LocalPath}|Select-Object SID,LocalPath,Loaded,Special,LastUseTime
+ $logons=Get-CimInstance Win32_LogonSession -ErrorAction SilentlyContinue|Select-Object LogonId,LogonType,StartTime,AuthenticationPackage
+ ExportSet 'local_users' $users
+ ExportSet 'local_groups' $groups
+ ExportSet 'administrators_members' $admins
+ ExportSet 'user_profiles' $profiles
+ ExportSet 'logon_sessions' $logons
+ RT 'Usuarios y sesiones'
+ Tbl @('Name','Enabled','LastLogon','PasswordLastSet') @($users)
+ ST 'Usuarios' 'OK' ("{0} cuentas locales / {1} perfiles" -f (($users|Measure-Object).Count),(($profiles|Measure-Object).Count))
 }
 
-# -----------------------------------------
-# 3. Estado Windows Defender
-# -----------------------------------------
-function Get-EstadoWindowsDefender {
-    Add-Title "3. Estado Windows Defender (Resultado)" 2
-
-    # Método 1: SecurityCenter2
-    Add-Line "Informacion desde SecurityCenter2:"
-    $avTxt = "WARNING No se detecto Windows Defender a traves de SecurityCenter2."
-    try {
-        $av = Get-CimInstance -Namespace "root/SecurityCenter2" -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
-        if ($av) {
-            foreach ($avProduct in $av) {
-                if ($avProduct.displayName -like "*Windows Defender*" -or $avProduct.displayName -like "*Windows Security*") {
-                    $state = try { [int]$avProduct.productState } catch { 0 }
-                    $hex = ('{0:X6}' -f $state)
-                    $sig = [int]("0x" + $hex.Substring(0,2))
-                    $rtp = [int]("0x" + $hex.Substring(2,2))
-                    $sts = [int]("0x" + $hex.Substring(4,2))
-                    
-                    $sigDesc = switch ($sig) { 
-                        0x00 { "OK Firmas al dia" } 
-                        0x10 { "WARNING Firmas desactualizadas" } 
-                        default { "NO Firmas estado 0x{0:X2}" -f $sig } 
-                    }
-                    $rtpDesc = switch ($rtp) { 
-                        0x00 { "NO Proteccion en tiempo real OFF" } 
-                        0x01 { "NO Proteccion en tiempo real OFF" }
-                        0x10 { "OK Proteccion en tiempo real ON" } 
-                        0x11 { "WARNING Proteccion en tiempo real PARCIAL" }
-                        default { "NO Tiempo real 0x{0:X2}" -f $rtp } 
-                    }
-                    $stsDesc = switch ($sts) { 
-                        0x00 { "NO No instalado" } 
-                        0x01 { "NO Deshabilitado" }
-                        0x10 { "OK Instalado" } 
-                        0x11 { "OK Instalado y ejecutandose" }
-                        default { "NO Estado 0x{0:X2}" -f $sts } 
-                    }
-                    
-                    $avTxt = "$($avProduct.displayName) - $rtpDesc / $sigDesc / $stsDesc"
-                    Add-Line $avTxt
-                    Add-Line "Codigo de estado: $state (hex: $hex)"
-                }
-            }
-        } else {
-            Add-Line $avTxt
-        }
-    } catch {
-        Add-Line "ERROR Error consultando SecurityCenter2: $($_.Exception.Message)"
-    }
-
-    # Método 2: PowerShell Module
-    Add-Line ""
-    Add-Line "Informacion desde modulo PowerShell:"
-    try {
-        if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
-            $defenderStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
-            if ($defenderStatus) {
-                $rows = @(
-                    [pscustomobject]@{ Componente = "Proteccion en tiempo real"; Estado = if ($defenderStatus.RealTimeProtectionEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "Motor de antivirus"; Estado = if ($defenderStatus.AntivirusEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "Antispyware"; Estado = if ($defenderStatus.AntispywareEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "Comportamiento"; Estado = if ($defenderStatus.BehaviorMonitorEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "IOAV Protection"; Estado = if ($defenderStatus.IoavProtectionEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "Nube"; Estado = if ($defenderStatus.CloudEnabled) { "OK ACTIVADO" } else { "NO DESACTIVADO" } },
-                    [pscustomobject]@{ Componente = "Firmas actualizadas"; Estado = if ($defenderStatus.AntivirusSignatureUpdated) { "OK SI" } else { "NO NO" } },
-                    [pscustomobject]@{ Componente = "Ultima actualizacion"; Estado = if ($defenderStatus.AntivirusSignatureAge) { "$($defenderStatus.AntivirusSignatureAge) dias" } else { "Desconocido" } }
-                )
-                Add-Table @("Componente", "Estado") $rows
-                
-                # Resumen general
-                $activeComponents = ($rows | Where-Object { $_.Estado -like "OK*" }).Count
-                $totalComponents = $rows.Count
-                Add-Line "Resumen: $activeComponents de $totalComponents componentes activos"
-                
-                if ($activeComponents -eq $totalComponents) {
-                    Set-Summary "Windows Defender" "OK Totalmente operativo"
-                } elseif ($activeComponents -ge 5) {
-                    Set-Summary "Windows Defender" "WARNING Parcialmente operativo ($activeComponents/$totalComponents)"
-                } else {
-                    Set-Summary "Windows Defender" "NO Con problemas ($activeComponents/$totalComponents)"
-                }
-            } else {
-                Add-Line "NO No se pudo obtener el estado de Windows Defender"
-                Set-Summary "Windows Defender" "NO No disponible"
-            }
-        } else {
-            Add-Line "INFO Modulo PowerShell de Defender no disponible"
-            Set-Summary "Windows Defender" "INFO Modulo no disponible"
-        }
-    } catch {
-        Add-Line "ERROR Error consultando modulo PowerShell: $($_.Exception.Message)"
-        Set-Summary "Windows Defender" "ERROR Error al consultar"
-    }
+function CollectNetwork{
+ $ip=@(); try{ $ip=Get-NetIPConfiguration -ErrorAction Stop|Select-Object InterfaceAlias,InterfaceDescription,IPv4Address,IPv6Address,IPv4DefaultGateway,DNSServer }catch{ LG WARN "Get-NetIPConfiguration no disponible." }
+ $ad=@(); try{ $ad=Get-NetAdapter -ErrorAction Stop|Select-Object Name,InterfaceDescription,Status,MacAddress,LinkSpeed }catch{ LG WARN "Get-NetAdapter no disponible." }
+ $tcp=@(); try{ $tcp=Get-NetTCPConnection -ErrorAction Stop|Select-Object State,LocalAddress,LocalPort,RemoteAddress,RemotePort,OwningProcess }catch{ LG WARN "Get-NetTCPConnection no disponible." }
+ $udp=@(); try{ $udp=Get-NetUDPEndpoint -ErrorAction Stop|Select-Object LocalAddress,LocalPort,OwningProcess }catch{ LG WARN "Get-NetUDPEndpoint no disponible." }
+ $dns=@(); try{ $dns=Get-DnsClientCache -ErrorAction Stop|Select-Object Entry,Data,Type,Status,TimeToLive }catch{ LG WARN "Get-DnsClientCache no disponible." }
+ $shares=@(); try{ $shares=Get-SmbShare -ErrorAction Stop|Select-Object Name,Path,Description,FolderEnumerationMode }catch{ LG WARN "Get-SmbShare no disponible." }
+ $sess=@(); try{ $sess=Get-SmbSession -ErrorAction Stop|Select-Object ClientComputerName,ClientUserName,NumOpens,ConnectedTime }catch{ LG WARN "Get-SmbSession no disponible." }
+ $rdp=[pscustomobject]@{fDenyTSConnections=(Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue).fDenyTSConnections;PortNumber=(Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue).PortNumber}
+ $wifi=@(); try{ $wifi=netsh wlan show profiles 2>$null|Where-Object{$_ -match 'All User Profile|Perfil de todos los usuarios'}|ForEach-Object{($_ -split ':\s*',2)[1].Trim()}|Where-Object{$_} }catch{}
+ ExportSet 'network_ip_configuration' $ip
+ ExportSet 'network_adapters' $ad
+ ExportSet 'network_tcp_connections' $tcp
+ ExportSet 'network_udp_endpoints' $udp
+ ExportSet 'network_dns_cache' $dns
+ ExportSet 'network_shares' $shares
+ ExportSet 'network_smb_sessions' $sess
+ ExportSet 'network_rdp' $rdp -NoCsv
+ ExportSet 'network_wifi_profiles' ($wifi|ForEach-Object{[pscustomobject]@{Profile=$_}})
+ CmdOut 'ipconfig_all' { ipconfig /all }|Out-Null
+ CmdOut 'arp_a' { arp -a }|Out-Null
+ CmdOut 'route_print' { route print }|Out-Null
+ CmdOut 'netstat_ano' { netstat -ano }|Out-Null
+ CmdOut 'wlan_profiles' { netsh wlan show profiles }|Out-Null
+ CmdOut 'firewall_profiles_raw' { netsh advfirewall show allprofiles }|Out-Null
+ RT 'Red'
+ Tbl @('Name','Status','MacAddress','LinkSpeed') @($ad)
+ ST 'Red' 'OK' ("{0} adaptadores / {1} conexiones TCP" -f (($ad|Measure-Object).Count),(($tcp|Measure-Object).Count))
 }
 
-# -----------------------------------------
-# 4. Protector Pantalla
-# -----------------------------------------
-function Get-ProtectorPantalla {
-    Add-Title "4. Estado del Protector de Pantalla (Resultado)" 2
-    $reg = "HKCU:\Control Panel\Desktop"
-    try {
-        $active = (Get-ItemPropertyValue -Path $reg -Name "ScreenSaveActive" -ErrorAction Stop)
-        
-        # Manejar timeout que puede no existir
-        $timeout = $null
-        try {
-            $timeout = (Get-ItemPropertyValue -Path $reg -Name "ScreenSaveTimeOut" -ErrorAction SilentlyContinue)
-        } catch {
-            $timeout = $null
-        }
-        
-        # Manejar secure que puede no existir
-        $secure = $null
-        try {
-            $secure = (Get-ItemPropertyValue -Path $reg -Name "ScreenSaverIsSecure" -ErrorAction SilentlyContinue)
-        } catch {
-            $secure = $null
-        }
-
-        if ($active -eq "1") {
-            $mins = if ($timeout) { [math]::Round(([int]$timeout)/60,1) } else { "No configurado" }
-            Add-Line "OK Protector de pantalla ACTIVADO."
-            Add-Line "Se activa tras $mins minutos de inactividad."
-            if ($secure -eq "1") { 
-                Add-Line "Configurado para bloquear la sesion al activarse." 
-            } else { 
-                Add-Line "WARNING NO bloquea la sesion al activarse." 
-            }
-            Set-Summary "Protector pantalla" "OK Activado"
-        } else {
-            Add-Line "NO Protector de pantalla DESACTIVADO."
-            Set-Summary "Protector pantalla" "NO Desactivado"
-        }
-    } catch {
-        Add-Line "WARNING Error al leer configuracion del protector de pantalla: $($_.Exception.Message)"
-        Set-Summary "Protector pantalla" "WARNING Error al consultar"
-    }
+function CollectRuntime{
+ $proc=Get-Process -ErrorAction SilentlyContinue|Select-Object ProcessName,Id,Path,Company,StartTime,CPU,Handles
+ $svc=Get-Service -ErrorAction SilentlyContinue|Select-Object Name,DisplayName,Status,StartType
+ $drv=Get-CimInstance Win32_SystemDriver -ErrorAction SilentlyContinue|Select-Object Name,DisplayName,State,StartMode,PathName
+ $tasks=Get-ScheduledTask -ErrorAction SilentlyContinue|Select-Object TaskName,TaskPath,State,Author,Description
+ $run=@(RegVals 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run')+@(RegVals 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run')+@(RegVals 'HKLM:\Software\Microsoft\Windows\CurrentVersion\RunOnce')+@(RegVals 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce')
+ $pref=Get-ChildItem -LiteralPath "$env:SystemRoot\Prefetch" -File -ErrorAction SilentlyContinue|Select-Object Name,Length,LastWriteTime
+ ExportSet 'processes' $proc
+ ExportSet 'services' $svc
+ ExportSet 'drivers' $drv
+ ExportSet 'scheduled_tasks' $tasks
+ ExportSet 'autoruns_registry' $run
+ ExportSet 'prefetch_listing' $pref
+ CmdOut 'tasklist_v' { tasklist /v }|Out-Null
+ CmdOut 'schtasks_query' { schtasks /query /fo LIST /v }|Out-Null
+ CmdOut 'wmic_startup' { wmic startup get Caption,Command,Location,User /format:list }|Out-Null
+ CopyIf "$env:SystemRoot\Prefetch" $script:Dirs.Raw -Rec|Out-Null
+ RT 'Procesos, servicios y persistencia'
+ Tbl @('ProcessName','Id','Path','StartTime') @($proc|Select-Object -First 20)
+ ST 'Ejecucion' 'OK' ("{0} procesos / {1} tareas programadas" -f (($proc|Measure-Object).Count),(($tasks|Measure-Object).Count))
 }
 
-# -----------------------------------------
-# 5. Redes Wi-Fi guardadas
-# -----------------------------------------
-function Get-WifiGuardadas {
-    Add-Title "5. Redes Wi-Fi Guardadas (Resultado)" 2
-    $profiles = @()
-    try {
-        $raw = netsh wlan show profiles 2>$null
-        $profiles = $raw | Where-Object { $_ -match "All User Profile|Perfil de todos los usuarios" } |
-            ForEach-Object { ($_ -split ":\s*",2)[1].Trim() } | Where-Object { $_ -and $_ -ne "" } | Select-Object -Unique
-    } catch {
-        # Catch vacio pero valido
-    }
-
-    if (-not $profiles -or $profiles.Count -eq 0) {
-        Add-Line "No se encontraron perfiles Wi-Fi."
-        Set-Summary "Wi-Fi" "INFO 0 perfiles"
-        return
-    }
-    $rows = @()
-    foreach ($p in $profiles) {
-        $details = netsh wlan show profile name="$p" key=clear 2>$null
-        $hasKey = $details | Select-String "Key Content|Contenido de la clave"
-        $security = if ($hasKey) { "Con clave (no mostrada)" } else { "Sin clave" }
-        $rows += [pscustomobject]@{ "Perfil" = $p; "Seguridad" = $security }
-    }
-    Add-Table @("Perfil","Seguridad") $rows
-    Set-Summary "Wi-Fi" ("INFO {0} perfiles" -f $profiles.Count)
+function CollectSecurity{
+ $fw=@(); try{ $fw=Get-NetFirewallProfile -ErrorAction Stop|Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction }catch{ LG WARN "Firewall profile no disponible." }
+ $mp=$null; if(Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue){ $mp=Get-MpComputerStatus -ErrorAction SilentlyContinue|Select-Object AMServiceEnabled,AntivirusEnabled,BehaviorMonitorEnabled,IoavProtectionEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AntivirusSignatureVersion }
+ $av=@(); try{ $av=Get-CimInstance -Namespace root/SecurityCenter2 -Class AntiVirusProduct -ErrorAction Stop|Select-Object displayName,pathToSignedProductExe,productState,timestamp }catch{ LG WARN "SecurityCenter2 no disponible o acceso denegado." }
+ $hf=@(); try{ $hf=Get-HotFix -ErrorAction Stop|Select-Object HotFixID,Description,InstalledBy,InstalledOn }catch{ LG WARN "Get-HotFix no disponible." }
+ $soft=@(); foreach($p in @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*','HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*')){ try{ $soft+=Get-ItemProperty -Path $p -ErrorAction SilentlyContinue|Where-Object{$_.DisplayName}|Select-Object DisplayName,DisplayVersion,Publisher,InstallDate,InstallLocation }catch{} }
+ ExportSet 'firewall_profiles' $fw
+ ExportSet 'windows_defender_status' $mp -NoCsv
+ ExportSet 'antivirus_products' $av
+ ExportSet 'hotfixes' $hf
+ ExportSet 'installed_software' ($soft|Sort-Object DisplayName -Unique)
+ CmdOut 'auditpol' { auditpol /get /category:* }|Out-Null
+ CmdOut 'whoami_all' { whoami /all }|Out-Null
+ CmdOut 'gpresult_r' { gpresult /r }|Out-Null
+ CmdOut 'net_accounts' { net accounts }|Out-Null
+ RT 'Seguridad'
+ Tbl @('Name','Enabled','DefaultInboundAction','DefaultOutboundAction') @($fw)
+ ST 'Seguridad' 'OK' ("{0} hotfixes / {1} productos AV" -f (($hf|Measure-Object).Count),(($av|Measure-Object).Count))
 }
 
-# -----------------------------------------
-# 6. VPNs configuradas
-# -----------------------------------------
-function Get-VPNs {
-    Add-Title "6. VPNs Configuradas (Resultado)" 2
-    try {
-        $vpns = Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue
-        if (-not $vpns) { $vpns = Get-VpnConnection -ErrorAction SilentlyContinue }
-        if ($vpns) {
-            $rows = $vpns | Select-Object Name, ServerAddress, SplitTunneling, AllUserConnection
-            Add-Table @("Name","ServerAddress","SplitTunneling","AllUserConnection") $rows
-            Set-Summary "VPNs" ("INFO {0} VPN(s)" -f ($vpns | Measure-Object).Count)
-        } else {
-            Add-Line "No se encontraron conexiones VPN configuradas."
-            Set-Summary "VPNs" "INFO 0"
-        }
-    } catch {
-        Add-Line "WARNING Error al consultar VPNs: $($_.Exception.Message)"
-        Set-Summary "VPNs" "WARNING Error al consultar"
-    }
+function CollectRegistryDevices{
+ $usbStor=RegKeys 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR'
+ $usb=RegKeys 'HKLM:\SYSTEM\CurrentControlSet\Enum\USB'
+ $mounted=RegVals 'HKLM:\SYSTEM\MountedDevices'
+ $bam=RegKeys 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings'
+ $userAssist=RegKeys 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
+ $recentDocs=RegKeys 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs'
+ $shellBags=RegKeys 'HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU'
+ $filt=Get-CimInstance -Namespace root\subscription -Class __EventFilter -ErrorAction SilentlyContinue|Select-Object Name,Query,EventNamespace
+ $cons=Get-CimInstance -Namespace root\subscription -Class CommandLineEventConsumer -ErrorAction SilentlyContinue|Select-Object Name,CommandLineTemplate,ExecutablePath
+ $bind=Get-CimInstance -Namespace root\subscription -Class __FilterToConsumerBinding -ErrorAction SilentlyContinue|Select-Object Filter,Consumer
+ ExportSet 'registry_usbstor' $usbStor
+ ExportSet 'registry_usb' $usb
+ ExportSet 'registry_mounted_devices' $mounted
+ ExportSet 'registry_bam' $bam
+ ExportSet 'registry_userassist' $userAssist
+ ExportSet 'registry_recentdocs' $recentDocs
+ ExportSet 'registry_shellbags' $shellBags
+ ExportSet 'wmi_event_filters' $filt
+ ExportSet 'wmi_event_consumers' $cons
+ ExportSet 'wmi_bindings' $bind
+ CmdOut 'mountvol' { mountvol }|Out-Null
+ CopyIf "$env:SystemRoot\INF\setupapi.dev.log" $script:Dirs.Raw|Out-Null
+ CopyIf "$env:SystemRoot\appcompat\Programs\Amcache.hve" $script:Dirs.Raw|Out-Null
+ CopyIf "$env:SystemRoot\System32\sru\SRUDB.dat" $script:Dirs.Raw|Out-Null
+ RT 'Registro, dispositivos y persistencia WMI'
+ Tbl @('PSChildName','Name') @($usbStor|Select-Object -First 15)
+ ST 'Dispositivos' 'OK' ("USBSTOR: {0} / filtros WMI: {1}" -f (($usbStor|Measure-Object).Count),(($filt|Measure-Object).Count))
 }
 
-# -----------------------------------------
-# Funciones auxiliares
-# -----------------------------------------
-function Write-HeaderAndTOC {
-    Add-Title "Informe de Auditoria del Equipo" 1
-    Add-Block @(
-        "Generado: $(Fmt-Date $script:Now)",
-        "Equipo: $env:COMPUTERNAME",
-        "Usuario: $env:USERNAME",
-        "",
-        "---",
-        "### Tabla de contenidos",
-        "- 0. Informacion general del sistema",
-        "- 1. Permisos - Administrador", 
-        "- 2. Buscar Actualizaciones",
-        "- 3. Estado Windows Defender",
-        "- 4. Estado del Protector de Pantalla",
-        "- 5. Redes Wi-Fi Guardadas",
-        "- 6. VPNs Configuradas",
-        "",
-        "---"
-    )
+function CollectUserActivity{
+ $hist=@(); try{ Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue|ForEach-Object{ $h=Join-Path $_.FullName 'AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt'; if(Test-Path $h){ $dst=Join-Path $script:Dirs.Raw (Safe ("PSReadLine_"+$_.Name+'.txt')); Copy-Item -LiteralPath $h -Destination $dst -Force -ErrorAction Stop; $hist+=[pscustomobject]@{User=$_.Name;HistoryPath=$h;CopiedTo=$dst} } } }catch{ LG WARN "PSReadLine: $($_.Exception.Message)" }
+ $recent=Get-ChildItem -LiteralPath (Join-Path $env:APPDATA 'Microsoft\Windows\Recent') -Force -ErrorAction SilentlyContinue|Select-Object Name,FullName,Length,LastWriteTime
+ $jump=Get-ChildItem -LiteralPath (Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations') -Force -ErrorAction SilentlyContinue|Select-Object Name,FullName,Length,LastWriteTime
+ $down=Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE 'Downloads') -Force -ErrorAction SilentlyContinue|Select-Object Name,FullName,Length,CreationTime,LastWriteTime
+ $temp=Get-ChildItem -LiteralPath $env:TEMP -Force -ErrorAction SilentlyContinue|Select-Object Name,FullName,Length,CreationTime,LastWriteTime
+ ExportSet 'powershell_history_files' $hist
+ ExportSet 'recent_shortcuts' $recent
+ ExportSet 'jumplists' $jump
+ ExportSet 'downloads_listing' $down
+ ExportSet 'temp_listing' $temp
+ CopyIf (Join-Path $env:APPDATA 'Microsoft\Windows\Recent') $script:Dirs.Raw -Rec|Out-Null
+ RT 'Actividad de usuario'
+ Tbl @('User','HistoryPath','CopiedTo') @($hist)
+ ST 'Actividad usuario' 'OK' ("PSReadLine: {0} / Recent: {1}" -f (($hist|Measure-Object).Count),(($recent|Measure-Object).Count))
 }
 
-function Write-ResumenEjecutivo {
-    Add-Title "Resumen Ejecutivo" 2
-    $rows = @()
-    foreach ($k in $script:Summary.Keys) { $rows += [pscustomobject]@{ "Componente" = $k; "Estado/Detalle" = $script:Summary[$k] } }
-    if ($rows.Count -eq 0) { Add-Line "No hay elementos en el resumen" } else { Add-Table @("Componente","Estado/Detalle") $rows }
+function ExportEvents{
+ $logs=@('Application','System','Security','Windows PowerShell','Microsoft-Windows-PowerShell/Operational','Microsoft-Windows-TerminalServices-LocalSessionManager/Operational','Microsoft-Windows-TaskScheduler/Operational','Microsoft-Windows-Windows Defender/Operational')
+ $rows=@(); $i=0; foreach($log in $logs){ $i++; ShowProg -status ("Avanzado: exportando eventos {0}/{1} - {2}" -f $i,$logs.Count,$log) -step $script:ProgressCurrent -total $script:ProgressTotal -sub ([int](($i/$logs.Count)*20)); $safe=Safe $log; $evtx=Join-Path $script:Dirs.Events ($safe+'.evtx'); $csv=Join-Path $script:Dirs.Events ($safe+'-recent.csv'); $ok=$false; try{ & wevtutil.exe epl $log $evtx 2>$null | Out-Null; $ok=($LASTEXITCODE -eq 0); if($ok){ AddStat 'Events' } }catch{ LG WARN ("Export EVTX {0}: {1}" -f $log,$_.Exception.Message) }; try{ $ev=Get-WinEvent -LogName $log -MaxEvents 500 -ErrorAction Stop|Select-Object TimeCreated,Id,LevelDisplayName,ProviderName,MachineName,UserId,Message; $ev|Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding utf8; AddStat 'Events'; $cnt=($ev|Measure-Object).Count }catch{ $cnt=0; LG WARN ("Eventos {0}: {1}" -f $log,$_.Exception.Message) }; $rows+=[pscustomobject]@{Log=$log;EVTX=$(if($ok){'Si'}else{'No'});Recientes=$cnt} }
+ ExportSet 'event_logs_index' $rows
+ return $rows
 }
 
-# ================================
-# BANNER DE FINALIZACION
-# ================================
-function Show-CompletionBanner {
-    Write-Host ""
-    Write-Host "==================================================" -ForegroundColor Green
-    Write-Host "           AUDITORIA COMPLETADA" -ForegroundColor Yellow
-    Write-Host "==================================================" -ForegroundColor Green
-    Write-Host ""
-    Write-Host " Informe generado exitosamente" -ForegroundColor Green
-    Write-Host " Ubicacion: $ReportPath" -ForegroundColor White
-    Write-Host ""
-    Write-Host " Resumen ejecutivo:" -ForegroundColor Cyan
-    Write-Host " -----------------" -ForegroundColor Cyan
-    foreach ($k in $script:Summary.Keys) { 
-        Write-Host "  $k : $($script:Summary[$k])" -ForegroundColor White
-    }
-    Write-Host ""
-    Write-Host "==================================================" -ForegroundColor Green
-    Write-Host ""
+function ExportHives{
+ $items=@(@{Key='HKLM\SAM';Name='HKLM_SAM.hiv'},@{Key='HKLM\SYSTEM';Name='HKLM_SYSTEM.hiv'},@{Key='HKLM\SOFTWARE';Name='HKLM_SOFTWARE.hiv'},@{Key='HKLM\SECURITY';Name='HKLM_SECURITY.hiv'})
+ $rows=@(); $i=0; foreach($h in $items){ $i++; ShowProg -status ("Avanzado: exportando hive {0}/{1} - {2}" -f $i,$items.Count,$h.Key) -step $script:ProgressCurrent -total $script:ProgressTotal -sub (60 + [int](($i/$items.Count)*15)); $t=Join-Path $script:Dirs.Registry $h.Name; $ok=$false; try{ & reg.exe save $h.Key $t /y 2>$null | Out-Null; $ok=($LASTEXITCODE -eq 0); if($ok){ AddStat 'Registry' } }catch{ LG WARN ("Hive {0}: {1}" -f $h.Key,$_.Exception.Message) }; $rows+=[pscustomobject]@{Hive=$h.Key;Ruta=$t;Estado=$(if($ok){'Exportado'}else{'No disponible'})} }
+ ExportSet 'registry_hives' $rows
+ return $rows
 }
 
-# ================================
-# EJECUCION PRINCIPAL
-# ================================
-Show-Banner
-
-# Mostrar progreso inicial
-Show-Progress -Activity "Iniciando auditoria de seguridad" -Status "Preparando sistema..." -PercentComplete 0
-
-Write-HeaderAndTOC
-Show-Progress -Activity "Generando informe" -Status "Informacion general del sistema..." -PercentComplete 10
-
-Get-InfoGeneral
-Show-Progress -Activity "Generando informe" -Status "Verificando permisos..." -PercentComplete 20
-
-Get-Permisos-Administrador
-Show-Progress -Activity "Generando informe" -Status "Comprobando actualizaciones..." -PercentComplete 30
-
-Get-Actualizaciones
-Show-Progress -Activity "Generando informe" -Status "Analizando Windows Defender..." -PercentComplete 40
-
-Get-EstadoWindowsDefender
-Show-Progress -Activity "Generando informe" -Status "Revisando protector de pantalla..." -PercentComplete 50
-
-Get-ProtectorPantalla
-Show-Progress -Activity "Generando informe" -Status "Escaneando redes Wi-Fi..." -PercentComplete 60
-
-Get-WifiGuardadas
-Show-Progress -Activity "Generando informe" -Status "Verificando VPNs..." -PercentComplete 70
-
-Get-VPNs
-Show-Progress -Activity "Generando informe" -Status "Generando resumen ejecutivo..." -PercentComplete 80
-
-# Resumen al final
-Write-ResumenEjecutivo
-Show-Progress -Activity "Generando informe" -Status "Guardando reporte..." -PercentComplete 90
-
-# Guardar informe
-Save-Report
-
-# Completar progreso
-Show-Progress -Activity "Generando informe" -Status "Completado" -PercentComplete 100
-Start-Sleep -Milliseconds 500
-Write-Progress -Activity "Generando informe" -Completed
-
-Show-CompletionBanner
-
-if ($VerboseReport) {
-    Write-Host "--- Resumen rapido ---" -ForegroundColor Cyan
-    foreach ($k in $script:Summary.Keys) { Write-Host ("{0}: {1}" -f $k, $script:Summary[$k]) -ForegroundColor White }
+function ExportUserHives{
+ $profiles=@(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue|Where-Object{$_.LocalPath})
+ $rows=@(); $i=0; foreach($p in $profiles){ $i++; if($profiles.Count -gt 0){ ShowProg -status ("Avanzado: copiando hives de usuario {0}/{1}" -f $i,$profiles.Count) -step $script:ProgressCurrent -total $script:ProgressTotal -sub (20 + [int](($i/$profiles.Count)*20)) }; $dst=Join-Path $script:Dirs.Registry (Safe ([IO.Path]::GetFileName($p.LocalPath))); New-Item -ItemType Directory -Path $dst -Force|Out-Null; $a=CopyIf (Join-Path $p.LocalPath 'NTUSER.DAT') $dst; $b=CopyIf (Join-Path $p.LocalPath 'AppData\Local\Microsoft\Windows\UsrClass.dat') $dst; if($a){ AddStat 'Registry' }; if($b){ AddStat 'Registry' }; $rows+=[pscustomobject]@{Perfil=$p.LocalPath;SID=$p.SID;NTUSER=$(if($a){'Copiado'}else{'No'});UsrClass=$(if($b){'Copiado'}else{'No'})} }
+ ExportSet 'user_hives' $rows
+ return $rows
 }
+
+function CopyBrowsers{
+ $defs=@(
+  @{N='Chrome';B=(Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data');Type='Chromium'},
+  @{N='Edge';B=(Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data');Type='Chromium'},
+  @{N='Brave';B=(Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data');Type='Chromium'},
+  @{N='Opera';B=(Join-Path $env:APPDATA 'Opera Software');Type='Chromium';Profiles=@('Opera Stable','Opera GX Stable','Opera Beta','Opera Developer')},
+  @{N='Firefox';B=(Join-Path $env:APPDATA 'Mozilla\Firefox\Profiles');Type='Firefox'}
+ )
+ $rows=@(); $i=0; foreach($d in $defs){ $i++; ShowProg -status ("Avanzado: artefactos navegador {0}/{1} - {2}" -f $i,$defs.Count,$d.N) -step $script:ProgressCurrent -total $script:ProgressTotal -sub (40 + [int](($i/$defs.Count)*20)); $dir=Join-Path $script:Dirs.Browser $d.N; New-Item -ItemType Directory -Path $dir -Force|Out-Null; $c=0; if(Test-Path $d.B){ if($d.Type -eq 'Chromium'){ if($d.ContainsKey('Profiles') -and $d.Profiles){ $profiles=@(Get-ChildItem -LiteralPath $d.B -Directory -ErrorAction SilentlyContinue|Where-Object{ $name=$_.Name; @($d.Profiles|Where-Object{ $name -like $_ }).Count -gt 0 }) } else { $profiles=@(Get-ChildItem -LiteralPath $d.B -Directory -ErrorAction SilentlyContinue|Where-Object{ $_.Name -eq 'Default' -or $_.Name -like 'Profile *' }) }; foreach($p in $profiles){ foreach($rel in @('History','Network\Cookies','Login Data','Bookmarks','Preferences')){ $src=Join-Path $p.FullName $rel; if(Test-Path -LiteralPath $src){ try{ Copy-Item -LiteralPath $src -Destination (Join-Path $dir (Safe ($p.Name+'_'+$rel))) -Force -ErrorAction Stop; $c++; AddStat 'Browser' }catch{ LG WARN ("Browser {0}: {1}" -f $d.N,$_.Exception.Message) } } } } } else { $profiles=@(Get-ChildItem -LiteralPath $d.B -Directory -ErrorAction SilentlyContinue); foreach($p in $profiles){ foreach($name in @('places.sqlite','favicons.sqlite','extensions.json','cookies.sqlite','logins.json','key4.db')){ $src=Join-Path $p.FullName $name; if(Test-Path -LiteralPath $src){ try{ Copy-Item -LiteralPath $src -Destination (Join-Path $dir (Safe ($p.Name+'_'+$name))) -Force -ErrorAction Stop; $c++; AddStat 'Browser' }catch{ LG WARN ("Browser {0}: {1}" -f $d.N,$_.Exception.Message) } } } } } }; $rows+=[pscustomobject]@{Navegador=$d.N;BasePath=$d.B;Copias=$c;Estado=$(if($c -gt 0){'Recolectado'}elseif(Test-Path $d.B){'Detectado con bloqueos o sin ficheros objetivo'}else{'No detectado'})} }
+ ExportSet 'browser_artifacts' $rows
+ return $rows
+}
+
+function TimelineSeed{
+ ShowProg -status 'Avanzado: construyendo timeline inicial' -step $script:ProgressCurrent -total $script:ProgressTotal -sub 85
+ $rows=@(); try{ $rows+=Get-ChildItem -LiteralPath "$env:SystemRoot\Prefetch" -File -ErrorAction Stop|Select-Object Name,Length,CreationTimeUtc,LastWriteTimeUtc,FullName }catch{}
+ try{ $rows+=Get-ChildItem -LiteralPath (Join-Path $env:APPDATA 'Microsoft\Windows\Recent') -File -Force -ErrorAction Stop|Select-Object Name,Length,CreationTimeUtc,LastWriteTimeUtc,FullName }catch{}
+ try{ $rows+=Get-ChildItem -LiteralPath 'C:\$Recycle.Bin' -Recurse -Force -ErrorAction SilentlyContinue|Select-Object Name,Length,CreationTimeUtc,LastWriteTimeUtc,FullName }catch{}
+ $rows|Export-Csv -LiteralPath (Join-Path $script:Dirs.Timeline 'timeline_seed.csv') -NoTypeInformation -Encoding utf8
+ AddStat 'Timeline'
+ return $rows
+}
+
+function CollectAdvanced{
+ ShowProg -status 'Avanzado: preparando exportaciones pesadas' -step $script:ProgressCurrent -total $script:ProgressTotal -sub 1
+ $ev=ExportEvents
+ $uh=ExportUserHives
+ $bh=CopyBrowsers
+ $tl=TimelineSeed
+ if($script:IsAdmin){ $hh=ExportHives } else { Warn 'Sin admin no se exportan hives HKLM.'; LG WARN 'HKLM hives omitidos por falta de admin.' }
+ ShowProg -status 'Avanzado: finalizando resumen' -step $script:ProgressCurrent -total $script:ProgressTotal -sub 95
+ RT 'Artefactos avanzados'
+ Tbl @('Log','EVTX','Recientes') @($ev)
+ ST 'Artefactos avanzados' 'OK' ("Logs: {0} / hives usuario: {1} / timeline: {2}" -f (($ev|Measure-Object).Count),(($uh|Measure-Object).Count),(($tl|Measure-Object).Count))
+}
+
+function WriteMeta{
+ RT 'Resumen Ejecutivo'
+ Tbl @('Area','Estado','Detalle') $script:Summary.ToArray()
+ RT 'Estado de ejecucion'
+ Tbl @('Nombre','Estado','Segundos','Minutos') $script:Results.ToArray()
+ RT 'Estadisticas de artefactos'
+ $artifactRows=@(); foreach($k in $script:ArtifactStats.Keys){ $artifactRows+=[pscustomobject]@{Tipo=$k;Cantidad=$script:ArtifactStats[$k]} }
+ Tbl @('Tipo','Cantidad') @($artifactRows)
+ RT 'Metricas de ejecucion'
+ $okCount=@($script:Results.ToArray()|Where-Object{$_.Estado -eq 'OK'}).Count
+ $errCount=@($script:Results.ToArray()|Where-Object{$_.Estado -eq 'ERROR'}).Count
+ $metrics=@([pscustomobject]@{
+  Equipo=$env:COMPUTERNAME
+  Perfil=$script:Profile
+  Elevado=$(if($script:IsAdmin){'Si'}else{'No'})
+  FasesOK=$okCount
+  FasesError=$errCount
+  TiempoTotalSegundos=[math]::Round($script:RunTimer.Elapsed.TotalSeconds,2)
+  TiempoTotalMinutos=[math]::Round($script:RunTimer.Elapsed.TotalMinutes,2)
+ })
+ Tbl @('Equipo','Perfil','Elevado','FasesOK','FasesError','TiempoTotalSegundos','TiempoTotalMinutos') $metrics
+ RT 'Estructura de salida'
+ $rows=@(); foreach($k in $script:Dirs.Keys){ $rows+=[pscustomobject]@{Elemento=$k;Ruta=$script:Dirs[$k]} }
+ Tbl @('Elemento','Ruta') @($rows)
+}
+
+function SaveReport{ WriteMeta; SaveLines $script:ReportPath $script:Report }
+function Hashes{ $rows=Get-ChildItem -LiteralPath $script:CaseRoot -Recurse -File -ErrorAction SilentlyContinue|Where-Object{$_.FullName -ne $script:HashPath}|ForEach-Object{ try{ $h=Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256 -ErrorAction Stop; [pscustomobject]@{RelativePath=$_.FullName.Substring($script:CaseRoot.Length).TrimStart('\');Length=$_.Length;SHA256=$h.Hash;LastWriteTimeUtc=$_.LastWriteTimeUtc} }catch{ AddStat 'HashFailures'; [pscustomobject]@{RelativePath=$_.FullName.Substring($script:CaseRoot.Length).TrimStart('\');Length=$_.Length;SHA256='ERROR';LastWriteTimeUtc=$_.LastWriteTimeUtc} } }; $rows|Export-Csv -LiteralPath $script:HashPath -NoTypeInformation -Encoding utf8 }
+function Done{ Write-Host ''; C '============================================================' Green; C '                    ADQUISICION COMPLETADA                   ' Yellow; C '============================================================' Green; Write-Host " Caso    : $script:CaseRoot"; Write-Host " Informe : $script:ReportPath"; Write-Host " Log     : $script:LogPath"; Write-Host " Hashes  : $script:HashPath"; Write-Host (" Tiempo  : {0}s ({1} min)" -f [math]::Round($script:RunTimer.Elapsed.TotalSeconds,2),[math]::Round($script:RunTimer.Elapsed.TotalMinutes,2)); Write-Host ''; foreach($r in $script:Summary){ Write-Host (" - {0}: {1}" -f $r.Area,$r.Detalle) }; Write-Host ''; Write-Host ' Artefactos:' -ForegroundColor Cyan; foreach($k in $script:ArtifactStats.Keys){ Write-Host ("   {0}: {1}" -f $k,$script:ArtifactStats[$k]) } }
+
+Setup
+InitReport
+LG INFO "Inicio de adquisicion en $script:CaseRoot"
+$script:RunTimer=[Diagnostics.Stopwatch]::StartNew()
+$script:ProgressTotal = 7
+if($script:Profile -notlike 'Rapido*'){ $script:ProgressTotal = 8 }
+$script:ProgressCurrent = 0
+RunCollect 'Sistema' { CollectSystem }
+RunCollect 'Usuarios y sesiones' { CollectUsers }
+RunCollect 'Red' { CollectNetwork }
+RunCollect 'Procesos y persistencia' { CollectRuntime }
+RunCollect 'Seguridad' { CollectSecurity }
+RunCollect 'Registro y dispositivos' { CollectRegistryDevices }
+RunCollect 'Actividad de usuario' { CollectUserActivity }
+if($script:Profile -notlike 'Rapido*'){ RunCollect 'Artefactos avanzados' { CollectAdvanced } } else { ST 'Perfil' 'INFO' 'Rapido: sin exportacion de EVTX completos ni hives.'; LG INFO 'Perfil rapido: se omite adquisicion avanzada.' }
+ShowProg -status 'Calculando hashes y cerrando informe' -step ($script:ProgressTotal + 1) -total ($script:ProgressTotal + 1)
+Hashes
+$script:RunTimer.Stop()
+SaveReport
+LG INFO 'Adquisicion finalizada correctamente.'
+EndProg
+Done

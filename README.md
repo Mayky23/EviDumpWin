@@ -1,103 +1,163 @@
 # EviDumpWin
 
-Script de **auditoría automática para sistemas Windows** desarrollado en PowerShell.  
-Genera un **informe en formato Markdown (.md)** con información detallada del sistema, ideal para revisiones técnicas, inventarios, diagnósticos o documentación.
+`EviDumpWin.ps1` es un recolector forense de Windows orientado a auditorias y respuesta inicial en vivo. Funciona con una interfaz guiada en terminal: pide la ruta del caso, el nombre y el perfil de adquisicion, crea una estructura de salida completa y deja informe, artefactos crudos, log y manifiesto de hashes.
 
----
+## Que hace
 
-## 📌 Características
+- Crea una carpeta de caso elegida por el usuario.
+- Genera un informe Markdown ejecutivo y tecnico.
+- Exporta artefactos en `JSON`, `CSV` y `TXT` cuando aplica.
+- Guarda salidas crudas de utilidades del sistema.
+- Intenta copiar evidencias relevantes del host.
+- Calcula un manifiesto `SHA256` de lo recolectado.
+- Muestra progreso por fase y subfase durante la adquisicion.
+- Registra tiempos por modulo, tiempo total y conteo de artefactos generados.
+- Sigue trabajando aunque una fuente falle por permisos, bloqueo o ausencia del componente.
 
-- Detecta si el script se ejecuta con **permisos de administrador**
-- Recolecta información del sistema y del usuario actual
-- Muestra **barra de progreso** durante la ejecución
-- Genera un **informe Markdown estructurado**, listo para visualizar en GitHub, VS Code o convertir a PDF/HTML
-- Incluye un **resumen rápido opcional** al finalizar la ejecución
+## Flujo de uso
 
----
-
-## 📂 Salida
-
-Por defecto, el script genera el archivo:
-
-```
-Auditoria-Scripts(Resultado).md
-```
-
-en el directorio desde el que se ejecuta el script.
-
-El archivo contiene secciones con encabezados, tablas y valores clave del sistema.
-
----
-
-## ⚙️ Requisitos
-
-- Windows PowerShell 5.1 o superior  
-- Permisos de administrador (recomendado para información completa)
-- Política de ejecución que permita scripts (`RemoteSigned` o similar)
-
-Para habilitar ejecución de scripts (opcional):
+Ejecuta el script:
 
 ```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+.\EviDumpWin.ps1
 ```
 
----
+El asistente en terminal solicita:
 
-## 🚀 Uso
+1. Ruta base donde guardar el caso.
+2. Nombre del caso.
+3. Perfil de adquisicion.
 
-### Ejecución básica
+Perfiles disponibles:
+
+- `Rapido`: foco en evidencia volatil, estado actual, red, procesos, persistencia y actividad de usuario.
+- `Completo`: recomendado para auditoria forense general.
+- `Pro`: intenta extraer todo lo posible, incluidos EVTX, hives de usuario, timeline y artefactos avanzados adicionales.
+
+
+## Estructura de salida
+
+Cada ejecucion crea una carpeta de caso con esta estructura:
+
+```text
+<ruta-del-caso>\
+  Reports\
+    Informe_Forense.md
+    hash_manifest_sha256.csv
+  Logs\
+    EviDumpWin.log
+  Artifacts\
+    Json\
+    Csv\
+    Txt\
+    Raw\
+    Registry\
+    Events\
+    Browser\
+    Timeline\
+```
+
+## Artefactos que intenta recolectar
+
+### Sistema
+
+- Sistema operativo, build, BIOS, CPU, RAM y zona horaria.
+- Volumenes, discos y estado BitLocker.
+
+### Identidad y sesiones
+
+- Usuarios locales y grupos.
+- Miembros de `Administrators`.
+- Perfiles de usuario.
+- Sesiones de logon.
+
+### Red
+
+- Configuracion IP.
+- Adaptadores de red.
+- Conexiones TCP y endpoints UDP.
+- Cache DNS.
+- Shares SMB y sesiones SMB.
+- Configuracion RDP.
+- Perfiles Wi-Fi.
+- Salidas crudas de `ipconfig`, `arp`, `route`, `netstat` y `netsh`.
+
+### Ejecucion y persistencia
+
+- Procesos activos.
+- Servicios.
+- Drivers.
+- Tareas programadas.
+- Claves `Run` y `RunOnce`.
+- Inventario de Prefetch y copia del directorio cuando es posible.
+- Salidas crudas de `tasklist`, `schtasks` y `wmic startup`.
+
+### Seguridad
+
+- Perfiles de firewall.
+- Estado de Microsoft Defender si el modulo existe.
+- Productos antivirus registrados en `SecurityCenter2`.
+- Hotfixes.
+- Software instalado.
+- Salidas crudas de `auditpol`, `whoami /all`, `gpresult /r` y `net accounts`.
+
+### Registro, dispositivos y WMI
+
+- `USBSTOR`, `USB`, `MountedDevices`, `BAM`, `UserAssist`, `RecentDocs`, `ShellBags`.
+- Persistencia WMI con `__EventFilter`, `CommandLineEventConsumer` y bindings.
+- Copia de `setupapi.dev.log`, `Amcache.hve` y `SRUDB.dat` cuando es posible.
+
+### Actividad de usuario
+
+- Historiales `PSReadLine` por perfil.
+- `Recent Items` y Jump Lists.
+- Listado de `Downloads` y `%TEMP%`.
+- Copia de `Recent` cuando es posible.
+
+### Avanzado
+
+En perfiles de escaneo avanzado intenta ademas:
+
+- Exportar EVTX de logs relevantes.
+- Copiar `NTUSER.DAT` y `UsrClass.dat` por perfil.
+- Exportar hives `HKLM\\SAM`, `HKLM\\SYSTEM`, `HKLM\\SOFTWARE` y `HKLM\\SECURITY` si se ejecuta elevado.
+- Copiar artefactos de `Chrome`, `Edge`, `Brave`, `Opera` y `Firefox` desde rutas objetivo, reduciendo el coste del escaneo.
+- Crear un `timeline_seed.csv` inicial con Prefetch, Recent Items y papelera.
+
+## Contenido del informe final
+
+El informe incluye:
+
+- Resumen ejecutivo por areas.
+- Estado de ejecucion por modulo.
+- Tiempo por fase y tiempo total.
+- Estadisticas de artefactos generados.
+- Estructura de salida del caso.
+
+## Requisitos
+
+- Windows PowerShell 5.1 o PowerShell 7 en Windows.
+- Recomendado ejecutar la consola como administrador para maximizar cobertura.
+- Politica de ejecucion que permita scripts.
+
+Ejemplo para el usuario actual:
 
 ```powershell
-.EviDumpWin.ps1
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-### Especificar ruta personalizada del informe
+## Notas operativas
 
-```powershell
-.EviDumpWin.ps1 -ReportPath "C:\Reportes\AuditoriaSistema.md"
-```
+- Es una adquisicion live: no sustituye a una imagen forense offline.
+- Algunos archivos pueden estar bloqueados por el sistema o por aplicaciones abiertas.
+- Sin privilegios elevados ciertos artefactos quedaran incompletos o no se exportaran.
+- El manifiesto de hashes ayuda a verificar integridad de lo recolectado dentro de la carpeta de caso.
+- El log `Logs\EviDumpWin.log` deja trazabilidad de errores y fuentes no disponibles.
 
-### Mostrar resumen rápido en consola
+## Recomendaciones de uso forense
 
-```powershell
-.EviDumpWin.ps1 -VerboseReport
-```
-
----
-
-## 🧾 Parámetros
-
-| Parámetro | Tipo | Descripción |
-|---------|------|-------------|
-| `ReportPath` | `string` | Ruta y nombre del archivo Markdown de salida |
-| `VerboseReport` | `switch` | Muestra un resumen rápido al finalizar |
-
----
-
-## 🛠️ ¿Qué hace el script?
-
-- Inicializa variables globales y codificación UTF-8 con BOM
-- Muestra un **banner de inicio** con información del equipo
-- Ejecuta tareas de auditoría mostrando progreso
-- Construye el informe mediante funciones reutilizables:
-  - Encabezados
-  - Tablas clave/valor
-  - Tablas estructuradas
-- Guarda el informe y muestra confirmación final
-
----
-
-## 📄 Ejemplo de contenido del informe
-
-- Información del equipo
-- Usuario y fecha de ejecución
-- Estado de permisos
-- Resultados organizados en tablas Markdown
-
----
-
-## 🔐 Notas
-
-- Algunas comprobaciones pueden devolver información limitada si no se ejecuta como administrador.
-- El informe está optimizado para Markdown estándar.
+- Ejecutar desde una consola elevada cuando el escenario lo permita.
+- Guardar el caso en una ruta distinta al perfil del usuario auditado o en un volumen externo.
+- Minimizar la interaccion con el equipo antes de lanzar la recogida.
+- Documentar hora, operador, motivo de la adquisicion y contexto del sistema.
 
