@@ -1,5 +1,5 @@
 <#
- EviDumpWin 5.0 - Recolector forense en vivo para Windows
+ EviDumpWin 5.1 - Recolector forense en vivo para Windows
  Autor : Mayky
  Uso   : .\EviDumpWin.ps1   (asistente interactivo, sin parametros)
 #>
@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $global:LASTEXITCODE = 0
 
-$script:Version = '5.0'
+$script:Version = '5.1'
 $script:Now = Get-Date
 $script:IsAdmin = $false
 try{ $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }catch{}
@@ -18,7 +18,9 @@ $script:Interactive = [Environment]::UserInteractive -and -not ([Environment]::G
 $script:Utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:CsvEnc = 'UTF8'; if($PSVersionTable.PSVersion.Major -ge 6){ $script:CsvEnc = 'utf8BOM' }
-$script:Report = New-Object System.Collections.Generic.List[string]
+$script:Blocks = New-Object System.Collections.Generic.List[object]
+$script:SetPreview = [ordered]@{}
+$script:CaseInfo = @()
 $script:Summary = New-Object System.Collections.Generic.List[object]
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Findings = New-Object System.Collections.Generic.List[object]
@@ -29,6 +31,11 @@ $script:SidCache = @{}
 $script:Dirs = [ordered]@{}
 $script:CaseRoot = ''
 $script:ReportPath = ''
+$script:PdfPath = ''
+$script:JsonReportPath = ''
+$script:CsvReportDir = ''
+$script:PdfMethod = ''
+$script:PdfBrowser = $null
 $script:LogPath = ''
 $script:HashPath = ''
 $script:CopyLogPath = ''
@@ -45,7 +52,6 @@ $script:UserProfiles = @()
 $script:ArtifactStats = [ordered]@{
  Json = 0
  Csv = 0
- Txt = 0
  Raw = 0
  Registry = 0
  Events = 0
@@ -64,8 +70,13 @@ function Info([string]$m){ C "[*] $m" 'Cyan' }
 function Ok([string]$m){ C "[+] $m" 'Green' }
 function Warn([string]$m){ C "[!] $m" 'Yellow' }
 function Fail([string]$m){ C "[-] $m" 'Red' }
-function RL([string]$t=''){ $script:Report.Add($t) }
-function RT([string]$t,[int]$l=2){ RL ''; RL ((('#'*$l)+' '+$t)); RL '' }
+function RL([string]$t=''){
+ if([string]::IsNullOrWhiteSpace($t)){ return }
+ if($t.StartsWith('> ')){ $script:Blocks.Add([pscustomobject]@{K='N';T=$t.Substring(2)}); return }
+ if($t.StartsWith('- ')){ $script:Blocks.Add([pscustomobject]@{K='LI';T=$t.Substring(2)}); return }
+ $script:Blocks.Add([pscustomobject]@{K='P';T=$t})
+}
+function RT([string]$t,[int]$l=2){ $script:Blocks.Add([pscustomobject]@{K='H';L=$l;T=$t}) }
 function ST([string]$a,[string]$e,[string]$d){ $script:Summary.Add([pscustomobject]@{Area=$a;Estado=$e;Detalle=$d}) }
 function AddStat([string]$key,[int]$delta=1){ if($script:ArtifactStats.Contains($key)){ $script:ArtifactStats[$key]+=$delta } }
 function LG([string]$lvl,[string]$msg){
@@ -74,7 +85,7 @@ function LG([string]$lvl,[string]$msg){
  try{ Add-Content -LiteralPath $script:LogPath -Value ("[{0}] [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'),$lvl.ToUpper(),$msg) -Encoding utf8 }catch{}
 }
 function Finding([string]$area,[string]$sev,[string]$detail){ $script:Findings.Add([pscustomobject]@{Severidad=$sev;Area=$area;Detalle=$detail}); LG INFO "Hallazgo [$sev] $area - $detail" }
-function MdEsc([string]$s){ (($s -replace '\|','\|') -replace "`r",'') -replace "`n",'<br>' }
+function HtmlEnc([string]$s){ [System.Net.WebUtility]::HtmlEncode($s) }
 function Safe([string]$n){
  $s = (($n -replace '[\\/:*?"<>|\[\]]','_') -replace '\s+','_').Trim([char[]]'. ')
  if([string]::IsNullOrWhiteSpace($s)){ $s = 'sin_nombre' }
@@ -145,7 +156,6 @@ function SidName([string]$sid){
  $script:SidCache[$sid] = $n
  $n
 }
-function SaveLines([string]$p,[string[]]$lines){ $dir=Split-Path -Parent $p; if(-not(Test-Path -LiteralPath $dir)){ New-Item -ItemType Directory -Path $dir -Force | Out-Null }; [IO.File]::WriteAllLines($p,$lines,$script:Utf8Bom) }
 function Ask([string]$prompt,[string]$def){
  if(-not $script:Interactive){ return $def }
  $v = $null
@@ -172,22 +182,17 @@ function Menu([string]$title,[string[]]$opts,[int]$def=0){
   Warn 'Opcion no valida.'
  }
 }
-function Tbl([string[]]$h,[object[]]$rows,[int]$max=0){
+function Tbl([string[]]$h,[object[]]$rows,[int]$max=0,[string]$cls=''){
  if(-not $h){ return }
- RL ('| '+($h -join ' | ')+' |')
- RL ('|'+(($h | ForEach-Object { '---' }) -join '|')+'|')
- $n = 0
- foreach($r in @($rows)){
-  if($null -eq $r){ continue }
-  if($max -gt 0 -and $n -ge $max){ break }
-  $vals = foreach($x in $h){ $v = P $r $x; if($null -eq $v -or "$v" -eq ''){ '-' } else { MdEsc ([string]$v) } }
-  RL ('| '+($vals -join ' | ')+' |')
-  $n++
+ $all = @($rows | Where-Object { $null -ne $_ })
+ $out = New-Object System.Collections.Generic.List[object]
+ foreach($r in $all){
+  if($max -gt 0 -and $out.Count -ge $max){ break }
+  $cells = New-Object System.Collections.Generic.List[string]
+  foreach($x in $h){ $v = P $r $x; if($null -eq $v){ $cells.Add('') } else { $cells.Add([string]$v) } }
+  $out.Add($cells.ToArray())
  }
- if($n -eq 0){ RL ('| '+(($h | ForEach-Object { '-' }) -join ' | ')+' |') }
- $total = @($rows | Where-Object { $null -ne $_ }).Count
- if($max -gt 0 -and $total -gt $max){ RL ''; RL ("_Mostrando {0} de {1} filas. Ver artefactos JSON/CSV._" -f $max,$total) }
- RL ''
+ $script:Blocks.Add([pscustomobject]@{K='T';H=$h;R=$out.ToArray();Total=$all.Count;Cls=$cls})
 }
 function ToObj($o,[int]$d=0){
  if($null -eq $o){ return $null }
@@ -238,11 +243,9 @@ function ExportSet([string]$name,$data,[switch]$NoCsv,[switch]$Single){
   AddStat 'Json'
  }catch{ LG WARN ("JSON {0}: {1}" -f $name,$_.Exception.Message) }
  try{
-  $txt = '(sin datos)'
-  if($rows.Count -gt 0){ $txt = ($rows | Format-List * | Out-String -Width 4096) }
-  [IO.File]::WriteAllText((Join-Path $script:Dirs.Txt "$s.txt"),$txt,$script:Utf8Bom)
-  AddStat 'Txt'
- }catch{ LG WARN ("TXT {0}: {1}" -f $name,$_.Exception.Message) }
+  $prev = @(); if($rows.Count -gt 0 -and $null -ne $obj){ $prev = @(@($obj) | Select-Object -First 150 | ForEach-Object { Flat $_ }) }
+  $script:SetPreview[$s] = [pscustomobject]@{Filas=$rows.Count;Vista=$prev}
+ }catch{ LG WARN ("Vista previa {0}: {1}" -f $name,$_.Exception.Message) }
  $csv = 'No'
  if(-not $NoCsv -and $rows.Count -gt 0){
   try{
@@ -533,9 +536,12 @@ function Setup{
   Warn "El caso ya existia; se usara una carpeta nueva: $script:CaseRoot"
  }
  $script:Dirs = [ordered]@{}
- foreach($d in @(@('Reports','Reports'),@('Logs','Logs'),@('Json','Artifacts\Json'),@('Csv','Artifacts\Csv'),@('Txt','Artifacts\Txt'),@('Raw','Artifacts\Raw'),@('Files','Artifacts\Files'),@('Registry','Artifacts\Registry'),@('Events','Artifacts\Events'),@('Browser','Artifacts\Browser'),@('Timeline','Artifacts\Timeline'))){ $script:Dirs[$d[0]] = Join-Path $script:CaseRoot $d[1] }
+ foreach($d in @(@('Reports','Reports'),@('Logs','Logs'),@('Json','Artifacts\Json'),@('Csv','Artifacts\Csv'),@('Raw','Artifacts\Raw'),@('Files','Artifacts\Files'),@('Registry','Artifacts\Registry'),@('Events','Artifacts\Events'),@('Browser','Artifacts\Browser'),@('Timeline','Artifacts\Timeline'))){ $script:Dirs[$d[0]] = Join-Path $script:CaseRoot $d[1] }
  foreach($p in $script:Dirs.Values){ New-Item -ItemType Directory -Path $p -Force | Out-Null }
- $script:ReportPath = Join-Path $script:Dirs.Reports 'Informe_Forense.md'
+ $script:ReportPath = Join-Path $script:Dirs.Reports 'Informe_Forense.html'
+ $script:PdfPath = Join-Path $script:Dirs.Reports 'Informe_Forense.pdf'
+ $script:JsonReportPath = Join-Path $script:Dirs.Reports 'Informe_Forense.json'
+ $script:CsvReportDir = Join-Path $script:Dirs.Reports 'CSV'
  $script:LogPath = Join-Path $script:Dirs.Logs 'EviDumpWin.log'
  $script:CopyLogPath = Join-Path $script:Dirs.Logs 'acquisition_log.csv'
  $script:HashPath = Join-Path $script:Dirs.Reports 'hash_manifest_sha256.csv'
@@ -546,25 +552,24 @@ function Setup{
 }
 function InitReport{
  $tz = Get-TimeZone
- RT 'EviDumpWin - Adquisicion Forense Windows' 1
- RL "| Campo | Valor |"
- RL "|---|---|"
- RL "| Version | $script:Version |"
- RL "| Equipo | $env:COMPUTERNAME |"
- RL "| Usuario ejecutor | $env:USERDOMAIN\$env:USERNAME |"
- RL ("| Investigador | {0} |" -f (MdEsc $script:Investigator))
- RL ("| Motivo / referencia | {0} |" -f (MdEsc $script:CaseDesc))
- RL "| Perfil | $script:AcqProfile |"
- RL "| Elevado | $(if($script:IsAdmin){'Si'}else{'No'}) |"
- RL "| Inicio (local) | $($script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz')) |"
- RL "| Inicio (UTC) | $($script:Now.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) |"
  $off = $tz.GetUtcOffset($script:Now); $sign = '+'; if($off -lt [timespan]::Zero){ $sign = '-' }
- RL ("| Zona horaria | {0} (UTC{1}{2:hh\:mm}) |" -f $tz.DisplayName,$sign,$off.Duration())
- RL "| PowerShell | $($PSVersionTable.PSVersion) |"
- RL ("| Ruta del caso | {0} |" -f (MdEsc $script:CaseRoot))
- RL ''
+ $script:CaseInfo = @(
+  [pscustomobject]@{Campo='Version';Valor=$script:Version}
+  [pscustomobject]@{Campo='Equipo';Valor=$env:COMPUTERNAME}
+  [pscustomobject]@{Campo='Usuario ejecutor';Valor="$env:USERDOMAIN\$env:USERNAME"}
+  [pscustomobject]@{Campo='Investigador';Valor=$script:Investigator}
+  [pscustomobject]@{Campo='Motivo / referencia';Valor=$script:CaseDesc}
+  [pscustomobject]@{Campo='Perfil';Valor=$script:AcqProfile}
+  [pscustomobject]@{Campo='Elevado';Valor=$(if($script:IsAdmin){ 'Si' }else{ 'No' })}
+  [pscustomobject]@{Campo='Inicio (local)';Valor=$script:Now.ToString('yyyy-MM-dd HH:mm:ss zzz')}
+  [pscustomobject]@{Campo='Inicio (UTC)';Valor=$script:Now.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')}
+  [pscustomobject]@{Campo='Zona horaria';Valor=("{0} (UTC{1}{2:hh\:mm})" -f $tz.DisplayName,$sign,$off.Duration())}
+  [pscustomobject]@{Campo='PowerShell';Valor=[string]$PSVersionTable.PSVersion}
+  [pscustomobject]@{Campo='Ruta del caso';Valor=$script:CaseRoot}
+ )
+ RT 'Datos del caso'
+ Tbl @('Campo','Valor') $script:CaseInfo 0 'kv'
  RL '> Adquisicion en vivo: los resultados dependen de permisos, bloqueos y del estado del sistema. Las marcas de tiempo de artefactos se expresan en UTC salvo que se indique lo contrario.'
- RL ''
 }
 function LoadProfiles{
  $list = @()
@@ -1551,20 +1556,28 @@ function CollectFindings{
 }
 
 # ---------------------------------------------------------------- informe, manifiesto y cierre
-function BuildTop{
- $saved = $script:Report
- $script:Report = New-Object System.Collections.Generic.List[string]
+function BuildTop([switch]$Partial){
+ $saved = $script:Blocks
+ $script:Blocks = New-Object System.Collections.Generic.List[object]
+ if($Partial){ RL '> **ADQUISICION INCOMPLETA**: el proceso se interrumpio antes de terminar. Los datos recogidos hasta ese momento se incluyen igualmente.' }
  RT 'Resumen Ejecutivo'
  Tbl @('Area','Estado','Detalle') $script:Summary.ToArray()
  RT 'Indicadores a revisar'
- RL '> Indicadores automaticos para priorizar el analisis. No son conclusiones: deben verificarse manualmente.'; RL ''
+ RL '> Indicadores automaticos para priorizar el analisis. No son conclusiones: deben verificarse manualmente.'
  $ord = @{Alta=0;Media=1;Info=2}
  Tbl @('Severidad','Area','Detalle') @($script:Findings.ToArray() | Sort-Object { $ord[$_.Severidad] },Area) 150
  RT 'Estado de ejecucion'
  Tbl @('Nombre','Estado','Avisos','Segundos','Detalle') $script:Results.ToArray()
- $top = $script:Report
- $script:Report = $saved
+ $top = $script:Blocks
+ $script:Blocks = $saved
  $top.ToArray()
+}
+function FindBrowser{
+ $bases = @(${env:ProgramFiles(x86)},$env:ProgramFiles,$env:LOCALAPPDATA) | Where-Object { $_ }
+ foreach($rel in @('Microsoft\Edge\Application\msedge.exe','Google\Chrome\Application\chrome.exe','BraveSoftware\Brave-Browser\Application\brave.exe')){
+  foreach($b in $bases){ $p = Join-Path $b $rel; if(Test-Path -LiteralPath $p -PathType Leaf){ return $p } }
+ }
+ return $null
 }
 function WriteMeta{
  RT 'Indice de artefactos'
@@ -1579,29 +1592,334 @@ function WriteMeta{
   FasesOK=@($script:Results | Where-Object { $_.Estado -like 'OK*' }).Count; FasesError=@($script:Results | Where-Object { $_.Estado -eq 'ERROR' }).Count
   FinUtc=$end.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'); TiempoTotalMinutos=[math]::Round($script:RunTimer.Elapsed.TotalMinutes,2)
  }
+ $script:Data['metrics'] = $metrics
  Tbl @('Perfil','Elevado','FasesOK','FasesError','FinUtc','TiempoTotalMinutos') @($metrics)
  RT 'Huella de la adquisicion en el sistema'
  $vss = @($script:Copies | Where-Object { $_.Metodo -like 'esentutl*' }).Count
+ $script:PdfBrowser = FindBrowser
  RL "- Copias via sombra de volumen temporal (esentutl /vss): $vss."
  RL "- Compilacion de un tipo .NET para leer LastWrite del registro (Add-Type, ficheros temporales en %TEMP%): $(if($script:HasRegLW){'Si'}else{'No'})."
  RL '- Ejecucion de utilidades nativas de solo lectura (ipconfig, netstat, wevtutil, reg save, etc.).'
- RL "- Destino del caso: $(MdEsc $script:CaseRoot)"
- RL ''
- RT 'Integridad'
- RL '- `Reports\hash_manifest_sha256.csv`: SHA256 de todos los ficheros del caso, calculado tras cerrar el informe y el log.'
+ if($script:PdfBrowser){ RL ("- Generacion del PDF con {0} en modo headless, con un perfil temporal dentro de la carpeta del caso que se elimina al terminar." -f (Split-Path -Leaf $script:PdfBrowser)) }
+ else{ RL '- Generacion del PDF con el generador interno (no se encontro Edge ni Chrome).' }
+ RL "- Destino del caso: $script:CaseRoot"
+ RT 'Informes e integridad'
+ RL '- `Reports\Informe_Forense.html`: informe completo con estilos integrados y anexo con vista previa de cada conjunto de datos.'
+ RL '- `Reports\Informe_Forense.pdf`: version imprimible del informe.'
+ RL '- `Reports\Informe_Forense.json`: informe y todos los conjuntos de datos en un unico fichero JSON.'
+ RL '- `Reports\CSV\`: tablas del informe en CSV (resumen, indicadores, fases, estadisticas e indice de artefactos).'
+ RL '- `Artifacts\Json` y `Artifacts\Csv`: cada conjunto de datos por separado. `Artifacts\Raw`: salidas crudas de utilidades nativas.'
+ RL '- `Reports\hash_manifest_sha256.csv`: SHA256 de todos los ficheros del caso (incluidos estos informes), calculado tras cerrar los informes y el log.'
  RL '- `Reports\hash_manifest_sha256.csv.sha256`: SHA256 del propio manifiesto (anotarlo en la cadena de custodia).'
  RL '- `Logs\acquisition_log.csv`: origen, metodo y marcas de tiempo originales (UTC) de cada fichero copiado.'
- RL ''
  RT 'Estructura de salida'
  $rows=@(); foreach($k in $script:Dirs.Keys){ $rows += [pscustomobject]@{Elemento=$k;Ruta=(Rel $script:Dirs[$k])} }
  Tbl @('Elemento','Ruta') $rows
 }
+
+# ---------------------------------------------------------------- render HTML
+$script:Css = @'
+:root{--bg:#f3f5f9;--card:#fff;--ink:#1e293b;--mut:#64748b;--line:#e2e8f0;--pri:#0f172a;--acc:#0ea5e9;--red:#dc2626;--amb:#d97706;--grn:#16a34a;--blu:#2563eb}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 "Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+header.top{background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 55%,#0369a1 100%);color:#fff;padding:28px 40px 60px}
+header.top .brand{font-size:11px;letter-spacing:.2em;text-transform:uppercase;opacity:.8}
+header.top h1{margin:6px 0 6px;font-size:26px;font-weight:600}
+header.top .sub{opacity:.88;font-size:13px}
+header.top .sub span{margin-right:18px;white-space:nowrap}
+main{max-width:1500px;margin:0 auto;padding:0 40px 30px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px;margin:-40px 0 20px}
+.kpi{background:var(--card);border-radius:10px;padding:12px 16px;box-shadow:0 2px 6px rgba(15,23,42,.12);border-top:4px solid var(--acc)}
+.kpi .v{font-size:24px;font-weight:700;line-height:1.2}
+.kpi .l{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+.kpi.red{border-top-color:var(--red)}.kpi.amb{border-top-color:var(--amb)}.kpi.grn{border-top-color:var(--grn)}.kpi.blu{border-top-color:var(--blu)}
+.alert{background:#fef2f2;color:#991b1b;border:1px solid #fecaca;padding:10px 14px;border-radius:8px;margin:0 0 18px;font-weight:600}
+nav.toc{background:var(--card);border-radius:10px;padding:14px 22px;box-shadow:0 1px 3px rgba(15,23,42,.08);margin-bottom:18px}
+nav.toc h2{font-size:13px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.08em;color:var(--mut)}
+nav.toc ol{columns:3;column-gap:30px;margin:0;padding-left:20px}
+nav.toc a{color:var(--blu);text-decoration:none}nav.toc a:hover{text-decoration:underline}
+section{background:var(--card);border-radius:10px;padding:18px 22px;margin-bottom:16px;box-shadow:0 1px 3px rgba(15,23,42,.08)}
+section h2{margin:0 0 12px;font-size:17px;color:var(--pri);border-bottom:2px solid var(--line);padding-bottom:8px}
+h3{font-size:13px;margin:16px 0 6px;color:#334155}
+p{margin:6px 0}
+ul{margin:6px 0;padding-left:20px}li{margin:3px 0}
+.note{background:#f0f9ff;border-left:4px solid var(--acc);padding:8px 12px;border-radius:4px;color:#0c4a6e;margin:8px 0}
+.tw{overflow-x:auto;margin:6px 0 10px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th{background:#f1f5f9;color:#334155;text-align:left;font-weight:600;padding:6px 8px;border-bottom:2px solid var(--line);white-space:nowrap}
+td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top;word-break:break-word;max-width:640px}
+tbody tr:nth-child(even){background:#f8fafc}tbody tr:hover{background:#eef6ff}
+table.kv td:first-child{font-weight:600;width:220px;color:#334155;background:#f8fafc}
+.b{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:600;white-space:nowrap}
+.b-red{background:#fee2e2;color:#991b1b}.b-amb{background:#fef3c7;color:#92400e}.b-grn{background:#dcfce7;color:#166534}.b-blu{background:#dbeafe;color:#1e40af}.b-gry{background:#e2e8f0;color:#334155}
+.more,.empty{color:var(--mut);font-style:italic;margin:4px 0 10px}
+code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-family:Consolas,"Courier New",monospace;font-size:12px}
+details{border:1px solid var(--line);border-radius:8px;margin:8px 0;background:#fff}
+summary{cursor:pointer;padding:8px 12px;font-weight:600}
+summary .cnt{float:right;color:var(--mut);font-weight:400}
+details .tw,details .empty{margin:0 12px 10px}
+footer{color:var(--mut);font-size:11px;text-align:center;padding:6px 40px 30px}
+@page{size:A4 landscape;margin:10mm}
+@media print{
+ body{background:#fff;font-size:10px}
+ *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+ header.top{padding:16px 22px 48px}
+ main{padding:0 4px;max-width:none}
+ section,nav.toc,.kpi{box-shadow:none;border:1px solid var(--line)}
+ section{padding:10px 12px}
+ h2,h3{break-after:avoid}
+ tr,footer,summary{break-inside:avoid}
+ thead{display:table-header-group}
+ td{max-width:none}
+ .tw{overflow:visible}
+ nav.toc ol{columns:4}
+}
+'@
+function Inline([string]$t){
+ $h = HtmlEnc $t
+ $h = [regex]::Replace($h,'`([^`]+)`','<code>$1</code>')
+ [regex]::Replace($h,'\*\*([^*]+)\*\*','<strong>$1</strong>')
+}
+function BadgeCls([string]$v){
+ if($v -match '^(?i)(Alta|ERROR|NotSigned|HashMismatch|UnknownError)$'){ return 'b-red' }
+ if($v -match '^(?i)(Media|OK con avisos|Parcial|No)$'){ return 'b-amb' }
+ if($v -match '^(?i)(Info)$'){ return 'b-blu' }
+ if($v -match '^(?i)(OK|Exportado|Copiado|Si|Valid)$'){ return 'b-grn' }
+ 'b-gry'
+}
+function TableHtml($sb,[string[]]$h,$rows,[int]$total,[string]$cls=''){
+ $rows = @($rows)
+ if($rows.Count -eq 0){ [void]$sb.Append('<p class="empty">Sin datos.</p>'); return }
+ $badge = @(); for($i=0;$i -lt $h.Count;$i++){ if($h[$i] -in 'Severidad','Estado','EVTX','Firma'){ $badge += $i } }
+ [void]$sb.Append('<div class="tw"><table')
+ if($cls){ [void]$sb.Append(' class="'+$cls+'"') }
+ [void]$sb.Append('>')
+ if($cls -ne 'kv'){ [void]$sb.Append('<thead><tr>'); foreach($x in $h){ [void]$sb.Append('<th>'+(HtmlEnc $x)+'</th>') }; [void]$sb.Append('</tr></thead>') }
+ [void]$sb.Append('<tbody>')
+ foreach($r in $rows){
+  [void]$sb.Append('<tr>')
+  for($i=0;$i -lt $h.Count;$i++){
+   $v = ''; if($i -lt @($r).Count){ $v = [string]@($r)[$i] }
+   if($v.Length -gt 3000){ $v = $v.Substring(0,3000) + ' [...]' }
+   if($v -eq ''){ [void]$sb.Append('<td>-</td>') }
+   elseif($badge -contains $i){ [void]$sb.Append('<td><span class="b '+(BadgeCls $v)+'">'+(HtmlEnc $v)+'</span></td>') }
+   else{ [void]$sb.Append('<td>'+(HtmlEnc $v)+'</td>') }
+  }
+  [void]$sb.Append('</tr>')
+ }
+ [void]$sb.Append('</tbody></table></div>')
+ if($total -gt $rows.Count){ [void]$sb.Append(('<p class="more">Mostrando {0} de {1} filas. Datos completos en Artifacts\Json, Artifacts\Csv e Informe_Forense.json.</p>' -f $rows.Count,$total)) }
+}
+function RenderHtml([switch]$Partial){
+ $sb = New-Object System.Text.StringBuilder
+ $leaf = Split-Path -Leaf $script:CaseRoot
+ $gen = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+ [void]$sb.Append('<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">')
+ [void]$sb.Append('<title>EviDumpWin - '+(HtmlEnc $env:COMPUTERNAME)+' - '+(HtmlEnc $leaf)+'</title><style>'+$script:Css+'</style></head><body>')
+ [void]$sb.Append('<header class="top"><div class="brand">EviDumpWin '+(HtmlEnc $script:Version)+' &middot; Adquisicion forense en vivo</div>')
+ [void]$sb.Append('<h1>Informe forense &middot; '+(HtmlEnc $env:COMPUTERNAME)+'</h1><div class="sub">')
+ foreach($kv in @(@('Caso',$leaf),@('Perfil',$script:AcqProfile),@('Investigador',$script:Investigator),@('Inicio UTC',$script:Now.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')),@('Generado UTC',$gen))){ [void]$sb.Append('<span><b>'+$kv[0]+':</b> '+(HtmlEnc ([string]$kv[1]))+'</span>') }
+ [void]$sb.Append('</div></header><main>')
+ $alta = @($script:Findings | Where-Object { $_.Severidad -eq 'Alta' }).Count
+ $media = @($script:Findings | Where-Object { $_.Severidad -eq 'Media' }).Count
+ $fOk = @($script:Results | Where-Object { $_.Estado -like 'OK*' }).Count
+ $fErr = @($script:Results | Where-Object { $_.Estado -eq 'ERROR' }).Count
+ $files = 0; foreach($k in 'Files','Registry','Browser','Events','Raw'){ $files += [int]$script:ArtifactStats[$k] }
+ $min = 0; if($script:RunTimer){ $min = [math]::Round($script:RunTimer.Elapsed.TotalMinutes,1) }
+ $kpis = @(
+  @($alta,'Indicadores altos',$(if($alta -gt 0){ 'red' }else{ 'grn' })),
+  @($media,'Indicadores medios',$(if($media -gt 0){ 'amb' }else{ 'grn' })),
+  @(("{0}/{1}" -f $fOk,$script:Results.Count),'Fases correctas',$(if($fErr -gt 0){ 'red' }else{ 'grn' })),
+  @($script:SetIndex.Count,'Conjuntos de datos','blu'),
+  @($files,'Ficheros y salidas','blu'),
+  @("$min min",'Duracion','blu')
+ )
+ [void]$sb.Append('<div class="kpis">')
+ foreach($k in $kpis){ [void]$sb.Append('<div class="kpi '+$k[2]+'"><div class="v">'+(HtmlEnc ([string]$k[0]))+'</div><div class="l">'+$k[1]+'</div></div>') }
+ [void]$sb.Append('</div>')
+ if($Partial){ [void]$sb.Append('<div class="alert">ADQUISICION INCOMPLETA: el proceso se interrumpio antes de terminar.</div>') }
+ $heads = @($script:Blocks | Where-Object { $_.K -eq 'H' -and $_.L -le 2 })
+ [void]$sb.Append('<nav class="toc"><h2>Contenido</h2><ol>')
+ for($i=0;$i -lt $heads.Count;$i++){ [void]$sb.Append('<li><a href="#s'+($i+1)+'">'+(HtmlEnc $heads[$i].T)+'</a></li>') }
+ [void]$sb.Append('<li><a href="#anexo">Anexo: conjuntos de datos</a></li></ol></nav>')
+ $sec = 0; $open = $false; $inList = $false
+ foreach($b in $script:Blocks){
+  if($b.K -ne 'LI' -and $inList){ [void]$sb.Append('</ul>'); $inList = $false }
+  if($b.K -eq 'H'){
+   if($b.L -le 2){ if($open){ [void]$sb.Append('</section>') }; $sec++; [void]$sb.Append('<section id="s'+$sec+'"><h2>'+(HtmlEnc $b.T)+'</h2>'); $open = $true }
+   else{ [void]$sb.Append('<h3>'+(HtmlEnc $b.T)+'</h3>') }
+  }
+  elseif($b.K -eq 'P'){ $t = $b.T.TrimEnd(); if($t.EndsWith(':')){ [void]$sb.Append('<h3>'+(Inline $t.TrimEnd(':'))+'</h3>') } else { [void]$sb.Append('<p>'+(Inline $t)+'</p>') } }
+  elseif($b.K -eq 'N'){ [void]$sb.Append('<div class="note">'+(Inline $b.T)+'</div>') }
+  elseif($b.K -eq 'LI'){ if(-not $inList){ [void]$sb.Append('<ul>'); $inList = $true }; [void]$sb.Append('<li>'+(Inline $b.T)+'</li>') }
+  elseif($b.K -eq 'T'){ TableHtml $sb $b.H $b.R $b.Total $b.Cls }
+ }
+ if($inList){ [void]$sb.Append('</ul>') }
+ if($open){ [void]$sb.Append('</section>') }
+ [void]$sb.Append('<section id="anexo"><h2>Anexo: conjuntos de datos</h2><p>Vista previa de hasta 150 filas por conjunto. Los datos completos estan en <code>Artifacts\Json</code>, <code>Artifacts\Csv</code> y <code>Reports\Informe_Forense.json</code>.</p>')
+ foreach($k in $script:SetPreview.Keys){
+  $pv = $script:SetPreview[$k]
+  [void]$sb.Append('<details><summary>'+(HtmlEnc $k)+'<span class="cnt">'+$pv.Filas+' filas</span></summary>')
+  $vista = @($pv.Vista)
+  if($vista.Count -eq 0){ [void]$sb.Append('<p class="empty">Sin datos.</p>') }
+  else{
+   $cols = New-Object System.Collections.Generic.List[string]
+   foreach($r in $vista){ foreach($pp in $r.PSObject.Properties){ if(-not $cols.Contains($pp.Name)){ $cols.Add($pp.Name) } } }
+   $rl = New-Object System.Collections.Generic.List[object]
+   foreach($r in $vista){ $cells = New-Object System.Collections.Generic.List[string]; foreach($c in $cols){ $v = P $r $c; if($null -eq $v){ $cells.Add('') } else { $cells.Add([string]$v) } }; $rl.Add($cells.ToArray()) }
+   TableHtml $sb $cols.ToArray() $rl.ToArray() $pv.Filas
+  }
+  [void]$sb.Append('</details>')
+ }
+ [void]$sb.Append('</section></main>')
+ [void]$sb.Append('<footer>Generado por EviDumpWin '+(HtmlEnc $script:Version)+' el '+$gen+' UTC. La integridad de este informe y del resto del caso se verifica con <code>Reports\hash_manifest_sha256.csv</code> y su fichero <code>.sha256</code>.</footer></body></html>')
+ $sb.ToString()
+}
+
+# ---------------------------------------------------------------- render texto y PDF interno (respaldo sin navegador)
+function Fit([string]$s,[int]$w){ $s = ($s -replace '\s+',' ').Trim(); if($s.Length -le $w){ return $s.PadRight($w) }; if($w -le 1){ return $s.Substring(0,$w) }; $s.Substring(0,$w-1) + '~' }
+function RenderText([int]$width=180,[switch]$Partial){
+ $out = New-Object System.Collections.Generic.List[string]
+ $out.Add(("EVIDUMPWIN {0} - INFORME FORENSE - {1}" -f $script:Version,$env:COMPUTERNAME)); $out.Add(('=' * $width))
+ if($Partial){ $out.Add('*** ADQUISICION INCOMPLETA: el proceso se interrumpio antes de terminar ***') }
+ foreach($b in $script:Blocks){
+  if($b.K -eq 'H'){ $out.Add(''); $out.Add($b.T.ToUpper()); $out.Add(('-' * [math]::Min($width,$b.T.Length))) }
+  elseif($b.K -eq 'P'){ if($b.T.TrimEnd().EndsWith(':')){ $out.Add('') }; $out.Add(($b.T -replace '`','' -replace '\*\*','')) }
+  elseif($b.K -eq 'N'){ $out.Add('NOTA: ' + ($b.T -replace '`','' -replace '\*\*','')) }
+  elseif($b.K -eq 'LI'){ $out.Add('  * ' + ($b.T -replace '`','')) }
+  elseif($b.K -eq 'T'){
+   $h = @($b.H); $rows = @($b.R); $n = $h.Count
+   if($rows.Count -eq 0){ $out.Add('  (sin datos)'); continue }
+   $nat = @(); for($i=0;$i -lt $n;$i++){ $m = $h[$i].Length; foreach($r in $rows){ $l = ([string]@($r)[$i]).Length; if($l -gt $m){ $m = $l } }; $nat += [math]::Min($m,80) }
+   $avail = $width - 3*($n-1); $sum = 0; foreach($x in $nat){ $sum += $x }
+   $wd = @(); for($i=0;$i -lt $n;$i++){ $x = $nat[$i]; if($sum -le $avail){ $wd += $x } else { $wd += [math]::Min($x,[math]::Max([math]::Min($h[$i].Length,12),[math]::Floor($avail*$x/$sum))) } }
+   $out.Add((@(for($i=0;$i -lt $n;$i++){ Fit $h[$i] $wd[$i] }) -join ' | '))
+   $out.Add((@(for($i=0;$i -lt $n;$i++){ '-' * $wd[$i] }) -join '-+-'))
+   foreach($r in $rows){ $out.Add((@(for($i=0;$i -lt $n;$i++){ Fit ([string]@($r)[$i]) $wd[$i] }) -join ' | ')) }
+   if($b.Total -gt $rows.Count){ $out.Add(("  ... mostrando {0} de {1} filas" -f $rows.Count,$b.Total)) }
+  }
+ }
+ $out.ToArray()
+}
+function PdfEsc([string]$s){
+ $sb = New-Object System.Text.StringBuilder
+ foreach($ch in $s.ToCharArray()){
+  $c = [int]$ch
+  if($ch -eq '\' -or $ch -eq '(' -or $ch -eq ')'){ [void]$sb.Append('\').Append($ch) }
+  elseif($c -lt 32){ [void]$sb.Append(' ') }
+  elseif($c -gt 255){ [void]$sb.Append('?') }
+  else{ [void]$sb.Append($ch) }
+ }
+ $sb.ToString()
+}
+function WritePdfText([string[]]$lines,[string]$path){
+ $enc = [Text.Encoding]::GetEncoding(28591)
+ $W = 842; $H = 595; $M = 28; $fs = 6.5; $lead = 8
+ $cpl = [int][math]::Floor(($W-2*$M)/($fs*0.6))
+ $lpp = [int][math]::Floor(($H-2*$M-16)/$lead)
+ $wr = New-Object System.Collections.Generic.List[string]
+ foreach($l in $lines){ $t = [string]$l; if($t.Length -eq 0){ $wr.Add(''); continue }; while($t.Length -gt $cpl){ $wr.Add($t.Substring(0,$cpl)); $t = '    ' + $t.Substring($cpl) }; $wr.Add($t) }
+ $pages = [int][math]::Max(1,[math]::Ceiling($wr.Count/$lpp))
+ $ms = New-Object System.IO.MemoryStream
+ $off = New-Object 'System.Collections.Generic.List[long]'
+ $put = { param([string]$x) $bb = $enc.GetBytes($x); $ms.Write($bb,0,$bb.Length) }
+ & $put "%PDF-1.4`n%"; $ms.Write([byte[]](0xE2,0xE3,0xCF,0xD3,0x0A),0,5)
+ $off.Add($ms.Position); & $put "1 0 obj`n<< /Type /Catalog /Pages 2 0 R >>`nendobj`n"
+ $kids = (@(for($i=0;$i -lt $pages;$i++){ "{0} 0 R" -f (4+2*$i) }) -join ' ')
+ $off.Add($ms.Position); & $put ("2 0 obj`n<< /Type /Pages /Kids [{0}] /Count {1} >>`nendobj`n" -f $kids,$pages)
+ $off.Add($ms.Position); & $put "3 0 obj`n<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>`nendobj`n"
+ $ci = [Globalization.CultureInfo]::InvariantCulture
+ for($p=0;$p -lt $pages;$p++){
+  $cs = New-Object System.Text.StringBuilder
+  [void]$cs.Append(("BT /F1 {0} Tf {1} TL {2} {3} Td " -f $fs.ToString($ci),$lead.ToString($ci),$M,($H-$M-$fs)))
+  [void]$cs.Append('(' + (PdfEsc ("EviDumpWin {0} | {1} | Pagina {2} de {3}" -f $script:Version,$env:COMPUTERNAME,($p+1),$pages)) + ') Tj T* T* ')
+  for($j=$p*$lpp;$j -lt [math]::Min($wr.Count,($p+1)*$lpp);$j++){ [void]$cs.Append('(' + (PdfEsc $wr[$j]) + ') Tj T* ') }
+  [void]$cs.Append('ET')
+  $content = $cs.ToString()
+  $off.Add($ms.Position); & $put ("{0} 0 obj`n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {1} {2}] /Resources << /Font << /F1 3 0 R >> >> /Contents {3} 0 R >>`nendobj`n" -f (4+2*$p),$W,$H,(5+2*$p))
+  $off.Add($ms.Position); & $put ("{0} 0 obj`n<< /Length {1} >>`nstream`n" -f (5+2*$p),$enc.GetByteCount($content)); & $put $content; & $put "`nendstream`nendobj`n"
+ }
+ $xref = $ms.Position
+ & $put ("xref`n0 {0}`n0000000000 65535 f `n" -f ($off.Count+1))
+ foreach($o in $off){ & $put ("{0:D10} 00000 n `n" -f $o) }
+ & $put ("trailer`n<< /Size {0} /Root 1 0 R >>`nstartxref`n{1}`n%%EOF`n" -f ($off.Count+1),$xref)
+ [IO.File]::WriteAllBytes($path,$ms.ToArray())
+}
+function MakePdf([switch]$Partial){
+ $ErrorActionPreference = 'Continue'
+ $exe = $script:PdfBrowser
+ if($exe -and (Test-Path -LiteralPath $script:ReportPath)){
+  $tmp = Join-Path $script:CaseRoot ('_pdf_tmp_' + [guid]::NewGuid().ToString('N'))
+  try{
+   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+   if(Test-Path -LiteralPath $script:PdfPath){ Remove-Item -LiteralPath $script:PdfPath -Force -ErrorAction SilentlyContinue }
+   $uri = [Uri]::new($script:ReportPath,[UriKind]::Absolute).AbsoluteUri
+   $a = @('--headless=new','--disable-gpu','--no-first-run','--no-default-browser-check','--disable-extensions','--disable-sync','--disable-background-networking','--no-pdf-header-footer','--print-to-pdf-no-header',('"--user-data-dir={0}"' -f $tmp),('"--print-to-pdf={0}"' -f $script:PdfPath),$uri)
+   $sp = @{FilePath=$exe;ArgumentList=$a;PassThru=$true}
+   if([Environment]::OSVersion.Platform -eq 'Win32NT'){ $sp['WindowStyle'] = 'Hidden' }
+   $pr = Start-Process @sp
+   if(-not $pr.WaitForExit(240000)){ try{ $pr.Kill() }catch{}; LG WARN 'PDF: el navegador no termino en 4 minutos.' }
+   for($i=0;$i -lt 20 -and -not (Test-Path -LiteralPath $script:PdfPath);$i++){ Start-Sleep -Milliseconds 500 }
+  }catch{ LG WARN "PDF con navegador: $($_.Exception.Message)" }
+  finally{
+   for($i=0;$i -lt 10 -and (Test-Path -LiteralPath $tmp);$i++){ try{ Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction Stop }catch{ Start-Sleep -Milliseconds 700 } }
+   if(Test-Path -LiteralPath $tmp){ LG WARN "No se pudo eliminar el perfil temporal del navegador: $tmp" }
+  }
+  if((Test-Path -LiteralPath $script:PdfPath) -and (Get-Item -LiteralPath $script:PdfPath).Length -gt 0){ $script:PdfMethod = "Navegador headless ($(Split-Path -Leaf $exe))"; LG INFO "PDF generado con $script:PdfMethod"; return }
+  LG WARN 'El navegador no genero el PDF; se usa el generador interno.'
+ }
+ try{ WritePdfText (RenderText -Partial:$Partial) $script:PdfPath; $script:PdfMethod = 'Generador interno (texto)'; LG INFO 'PDF generado con el generador interno.' }catch{ LG WARN "PDF interno: $($_.Exception.Message)" }
+}
+
+# ---------------------------------------------------------------- JSON y CSV del informe
+function JsonOf($o){ $x = ToObj $o; if($null -eq $x){ return 'null' }; ConvertTo-Json -InputObject $x -Depth 6 }
+function WriteJsonReport([switch]$Partial){
+ $w = New-Object System.IO.StreamWriter($script:JsonReportPath,$false,$script:Utf8NoBom)
+ try{
+  $caso = [ordered]@{Herramienta='EviDumpWin';Version=$script:Version;Parcial=[bool]$Partial;GeneradoUtc=(Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')}
+  foreach($c in $script:CaseInfo){ $caso[$c.Campo] = $c.Valor }
+  $w.Write('{'); $w.Write("`n""caso"": "); $w.Write((JsonOf $caso))
+  foreach($part in @(@('resumen',$script:Summary.ToArray()),@('indicadores',$script:Findings.ToArray()),@('fases',$script:Results.ToArray()),@('estadisticas',$script:ArtifactStats),@('metricas',$script:Data['metrics']),@('indice_artefactos',$script:SetIndex.ToArray()),@('copias',$script:Copies.ToArray()))){
+   $v = $part[1]
+   if($v -is [array] -and $v.Count -eq 0){ $j = '[]' } else { $j = JsonOf $v }
+   $w.Write(",`n""" + $part[0] + """: "); $w.Write($j)
+  }
+  $w.Write(",`n""artefactos"": {")
+  $first = $true
+  foreach($k in $script:SetPreview.Keys){
+   $f = Join-Path $script:Dirs.Json "$k.json"
+   if(-not (Test-Path -LiteralPath $f)){ continue }
+   if(-not $first){ $w.Write(',') }; $first = $false
+   $w.Write("`n" + (ConvertTo-Json -InputObject ([string]$k)) + ': ')
+   $w.Write([IO.File]::ReadAllText($f))
+  }
+  $w.Write("`n}`n}`n")
+ }finally{ $w.Dispose() }
+}
+function CsvOut($rows,[string]$name,[string[]]$cols){
+ $p = Join-Path $script:CsvReportDir $name
+ $r = @($rows | Where-Object { $null -ne $_ })
+ if($r.Count -eq 0){ [IO.File]::WriteAllText($p,(($cols | ForEach-Object { '"' + $_ + '"' }) -join ',') + "`r`n",$script:Utf8Bom); return }
+ $r | Select-Object $cols | Export-Csv -LiteralPath $p -NoTypeInformation -Encoding $script:CsvEnc
+}
+function WriteCsvReports{
+ New-Item -ItemType Directory -Path $script:CsvReportDir -Force | Out-Null
+ CsvOut $script:CaseInfo 'caso.csv' @('Campo','Valor')
+ CsvOut $script:Summary.ToArray() 'resumen.csv' @('Area','Estado','Detalle')
+ CsvOut $script:Findings.ToArray() 'indicadores.csv' @('Severidad','Area','Detalle')
+ CsvOut $script:Results.ToArray() 'fases.csv' @('Nombre','Estado','Avisos','Segundos','Detalle')
+ $st = @(); foreach($k in $script:ArtifactStats.Keys){ $st += [pscustomobject]@{Tipo=$k;Cantidad=$script:ArtifactStats[$k]} }
+ CsvOut $st 'estadisticas.csv' @('Tipo','Cantidad')
+ CsvOut $script:SetIndex.ToArray() 'indice_artefactos.csv' @('Conjunto','Filas','CSV')
+}
 function SaveReport([switch]$Partial){
- $top = @(BuildTop)
- if($Partial){ $top = @('','> **ADQUISICION INCOMPLETA**: el proceso se interrumpio antes de terminar.','') + $top }
+ $top = @(BuildTop -Partial:$Partial)
  WriteMeta
- $script:Report.InsertRange($script:HeaderEnd,[string[]]$top)
- SaveLines $script:ReportPath $script:Report.ToArray()
+ $script:Blocks.InsertRange($script:HeaderEnd,[object[]]$top)
+ try{ [IO.File]::WriteAllText($script:ReportPath,(RenderHtml -Partial:$Partial),$script:Utf8NoBom) }catch{ LG WARN "Informe HTML: $($_.Exception.Message)" }
+ try{ WriteCsvReports }catch{ LG WARN "Informes CSV: $($_.Exception.Message)" }
+ try{ WriteJsonReport -Partial:$Partial }catch{ LG WARN "Informe JSON: $($_.Exception.Message)" }
+ MakePdf -Partial:$Partial
  $script:ReportSaved = $true
 }
 function SaveCopyLog{ try{ if($script:Copies.Count -gt 0){ $script:Copies | Export-Csv -LiteralPath $script:CopyLogPath -NoTypeInformation -Encoding $script:CsvEnc } }catch{ LG WARN "acquisition_log: $($_.Exception.Message)" } }
@@ -1628,7 +1946,10 @@ function Done{
  C '                    ADQUISICION COMPLETADA                   ' Yellow
  C '============================================================' Green
  Write-Host " Caso      : $script:CaseRoot"
- Write-Host " Informe   : $script:ReportPath"
+ Write-Host " HTML      : $script:ReportPath"
+ Write-Host " PDF       : $script:PdfPath ($script:PdfMethod)"
+ Write-Host " JSON      : $script:JsonReportPath"
+ Write-Host " CSV       : $script:CsvReportDir"
  Write-Host " Log       : $script:LogPath"
  Write-Host " Hashes    : $script:HashPath ($($script:ManifestCount) ficheros)"
  C (" SHA256 del manifiesto: {0}" -f $script:ManifestHash) Yellow
@@ -1656,7 +1977,7 @@ try{
  LoadProfiles
  InitRegLW
  InitReport
- $script:HeaderEnd = $script:Report.Count
+ $script:HeaderEnd = $script:Blocks.Count
  $phases = New-Object System.Collections.Generic.List[object]
  $phases.Add(@('Red',{ CollectNetwork }))
  $phases.Add(@('Procesos, servicios y drivers',{ CollectRuntime }))

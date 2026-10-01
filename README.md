@@ -1,11 +1,11 @@
 # EviDumpWin
 
-`EviDumpWin.ps1` es un recolector forense en vivo para Windows orientado a respuesta a incidentes y auditoria. Funciona con un asistente interactivo en terminal (sin parametros): pide la ruta del caso, el nombre, el investigador, el motivo y el perfil de adquisicion, y genera un caso completo con informe, artefactos, log, registro de custodia y manifiesto de hashes.
+`EviDumpWin.ps1` es un recolector forense en vivo para Windows orientado a respuesta a incidentes y auditoria. Funciona con un asistente interactivo en terminal (sin parametros): pide la ruta del caso, el nombre, el investigador, el motivo y el perfil de adquisicion, y genera un caso completo con informes, artefactos, log, registro de custodia y manifiesto de hashes.
 
 ## Que hace
 
 - Recoge primero la evidencia mas volatil (red y procesos) y despues el resto, siguiendo el orden de volatilidad.
-- Exporta cada conjunto de datos en `JSON`, `CSV` y `TXT`, mas salidas crudas de utilidades nativas.
+- Exporta informes con toda la informacion de la adquisicion en `JSON`, `CSV`, `PDF` y `HTML` (con CSS integrado), mas salidas crudas de utilidades nativas.
 - Copia evidencias del host conservando la estructura y las marcas de tiempo originales; los ficheros bloqueados (Amcache, SRUM, hives no cargadas, bases de datos de navegador) se copian via sombra de volumen temporal (`esentutl /vss`) cuando hay privilegios.
 - Exporta hives del registro con `reg save`, incluidas las de los usuarios con sesion iniciada.
 - Analiza artefactos de registro: BAM, UserAssist (ROT13 y contadores), RecentDocs, MRUs, ShellBags, USB, redes conocidas.
@@ -52,7 +52,10 @@ Si no se ejecuta como administrador, ofrece relanzarse elevado (UAC). En sesione
 ```text
 <ruta-del-caso>\
   Reports\
-    Informe_Forense.md
+    Informe_Forense.html
+    Informe_Forense.pdf
+    Informe_Forense.json
+    CSV\
     hash_manifest_sha256.csv
     hash_manifest_sha256.csv.sha256
   Logs\
@@ -61,7 +64,6 @@ Si no se ejecuta como administrador, ofrece relanzarse elevado (UAC). En sesione
   Artifacts\
     Json\
     Csv\
-    Txt\
     Raw\
     Files\
     Registry\
@@ -133,7 +135,20 @@ Si no se ejecuta como administrador, ofrece relanzarse elevado (UAC). En sesione
 - Prefetch, Amcache, SRUM, tareas XML, setupapi, repositorio WMI, logs del firewall, Recent/Jump Lists, ActivitiesCache.
 - Chrome, Edge, Brave, Vivaldi, Chromium, Opera, Opera GX y Firefox de todos los usuarios, con `Local State` y los ficheros auxiliares `-wal`, `-shm` y `-journal`.
 
-## Contenido del informe
+## Informes
+
+Todos los informes se generan al final de la adquisicion en `Reports\` y contienen la misma informacion:
+
+| Formato | Fichero | Contenido |
+|---|---|---|
+| `HTML` | `Informe_Forense.html` | Informe completo autocontenido con CSS integrado (sin dependencias externas): cabecera del caso, indicadores clave, indice, tablas por area con etiquetas de severidad y estado, y anexo con vista previa de cada conjunto de datos. |
+| `PDF` | `Informe_Forense.pdf` | Version imprimible del informe HTML (A4 apaisado). Se genera con Microsoft Edge o Google Chrome en modo headless; si no hay navegador disponible, con un generador PDF interno en texto. |
+| `JSON` | `Informe_Forense.json` | Datos del caso, resumen, indicadores, fases, estadisticas, registro de copias y **todos** los conjuntos de datos en un unico fichero. |
+| `CSV` | `CSV\*.csv` | Tablas del informe: caso, resumen, indicadores, fases, estadisticas e indice de artefactos. |
+
+Ademas, cada conjunto de datos se guarda por separado en `Artifacts\Json` y `Artifacts\Csv`, y las salidas crudas de las utilidades nativas en `Artifacts\Raw`.
+
+El informe incluye:
 
 - Datos del caso: investigador, motivo, perfil, zona horaria, inicio en local y UTC.
 - Resumen ejecutivo por area e indicadores a revisar ordenados por severidad.
@@ -144,7 +159,7 @@ Si no se ejecuta como administrador, ofrece relanzarse elevado (UAC). En sesione
 ## Integridad y cadena de custodia
 
 - `Logs\acquisition_log.csv`: cada fichero copiado con origen, destino, metodo (`Copy-Item`, `esentutl /vss`, `reg save`, `wevtutil epl`), estado y marcas de tiempo originales en UTC. Las copias conservan las fechas de creacion y modificacion del origen.
-- `Reports\hash_manifest_sha256.csv`: se calcula al final, cuando el informe y el log ya estan cerrados, por lo que cubre todos los ficheros del caso.
+- `Reports\hash_manifest_sha256.csv`: se calcula al final, cuando los informes (HTML, PDF, JSON y CSV) y el log ya estan cerrados, por lo que cubre todos los ficheros del caso.
 - `Reports\hash_manifest_sha256.csv.sha256`: SHA256 del manifiesto. Se muestra en pantalla al terminar; anotalo en la documentacion de custodia.
 
 ## Requisitos
@@ -152,11 +167,12 @@ Si no se ejecuta como administrador, ofrece relanzarse elevado (UAC). En sesione
 - Windows 10/11 o Windows Server 2016 o superior.
 - Windows PowerShell 5.1 o PowerShell 7 en Windows.
 - Consola elevada para obtener hives, EVTX de Seguridad, Prefetch, sesiones SMB y ficheros bloqueados.
+- Microsoft Edge o Google Chrome para el PDF con estilos (incluidos por defecto en Windows 10/11). Sin navegador se genera un PDF en texto.
 
 ## Notas operativas
 
 - Es una adquisicion en vivo: no sustituye a una imagen forense ni a un volcado de memoria.
-- Huella en el sistema: ejecucion de utilidades nativas, sombras de volumen temporales al copiar ficheros bloqueados y compilacion de un pequeno tipo .NET (`Add-Type`) para leer la fecha de ultima escritura de las claves del registro. Todo queda reflejado en el informe.
+- Huella en el sistema: ejecucion de utilidades nativas, sombras de volumen temporales al copiar ficheros bloqueados, compilacion de un pequeno tipo .NET (`Add-Type`) para leer la fecha de ultima escritura de las claves del registro y ejecucion de Edge/Chrome en modo headless para el PDF (con un perfil temporal dentro de la carpeta del caso que se elimina al terminar). Todo queda reflejado en el informe.
 - Los usuarios sin sesion iniciada se cubren mediante la copia de sus `NTUSER.DAT`/`UsrClass.dat`; el analisis directo del registro solo se hace sobre hives cargadas.
 - La carpeta del caso contiene datos sensibles (hives SAM/SECURITY, cookies y credenciales cifradas de navegadores): el asistente ofrece restringir sus permisos a Administradores, SYSTEM y el operador (no aplica en FAT/exFAT).
 - Los indicadores son automaticos y sirven para priorizar, no son conclusiones.
